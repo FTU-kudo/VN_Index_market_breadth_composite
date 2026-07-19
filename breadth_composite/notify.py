@@ -169,17 +169,10 @@ def send_telegram(
     image_path: Optional[str] = None,
 ) -> bool:
     """
-    Gửi ảnh + phân tích trong MỘT tin nhắn Telegram duy nhất.
-
-    Logic:
-      - Có ảnh → sendPhoto với caption (Telegram giới hạn 1024 ký tự)
-        → text được truncate vừa đủ 1024, KHÔNG gửi tin thứ 2
-      - Không có ảnh / ảnh lỗi → sendMessage với text (giới hạn 4096 ký tự)
-      - Parse mode Markdown cho cả hai trường hợp
-
-    Returns
-    -------
-    bool  True nếu gửi thành công
+    Gửi 2 message riêng biệt:
+      1. sendPhoto (ảnh chart, không caption)
+      2. sendMessage (toàn bộ text phân tích, max 4096 ký tự)
+    Tách ra để text không bị giới hạn 1024 ký tự của caption.
     """
     token   = os.environ.get("TELEGRAM_TOKEN", "").strip()
     chat_id = os.environ.get("TELEGRAM_ID", "").strip()
@@ -189,35 +182,25 @@ def send_telegram(
         return False
 
     base_url = f"https://api.telegram.org/bot{token}"
+    success  = True
 
+    # Message 1: ảnh chart (không caption)
     if image_path and Path(image_path).exists():
-        # Truncate caption tại đúng 1024 ký tự — không split, không tin thứ 2
-        caption = text[:1024]
         try:
             with open(image_path, "rb") as img:
                 resp = requests.post(
                     f"{base_url}/sendPhoto",
-                    data={
-                        "chat_id":    chat_id,
-                        "caption":    caption,
-                        "parse_mode": "Markdown",
-                    },
+                    data={"chat_id": chat_id},
                     files={"photo": img},
                     timeout=30,
                 )
             resp.raise_for_status()
-            logger.info(
-                "Telegram: sendPhoto OK (caption %d / %d chars)",
-                len(caption), len(text),
-            )
-            return True
-
+            logger.info("Telegram: sendPhoto OK")
         except Exception as exc:
-            logger.warning(
-                "Telegram sendPhoto failed (%s) — falling back to text-only", exc
-            )
+            logger.warning("Telegram sendPhoto failed: %s", exc)
+            success = False
 
-    # Fallback: text-only message, truncate tại 4096
+    # Message 2: text phân tích đầy đủ (4096 ký tự)
     try:
         resp = requests.post(
             f"{base_url}/sendMessage",
@@ -230,11 +213,11 @@ def send_telegram(
         )
         resp.raise_for_status()
         logger.info("Telegram: sendMessage OK (%d chars)", len(text[:4096]))
-        return True
-
     except Exception as exc:
         logger.error("Telegram sendMessage failed: %s", exc)
-        return False
+        success = False
+
+    return success
 
 
 def _send_text_message(base_url: str, chat_id: str, text: str) -> bool:
