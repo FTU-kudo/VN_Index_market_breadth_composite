@@ -298,43 +298,45 @@ def _plot_mcclellan(ax: plt.Axes, df: pd.DataFrame) -> None:
 # ---------------------------------------------------------------------------
 
 def _plot_high_low(ax: plt.Axes, df: pd.DataFrame) -> None:
-    _style_ax(ax, "Net New 52-Week Highs / Lows (%)")
+    """
+    Thay thế Net New 52W H/L (thường trống) bằng Net A/D Ratio:
+    = (Advances - Declines) / (Advances + Declines) * 100
+    Luôn có data từ ngày đầu tiên, phản ánh sức mạnh dòng tiền hàng ngày.
+    """
+    _style_ax(ax, "Net Advance / Decline Ratio (%)")
 
-    if "net_new_highs_pct" not in df.columns or \
-       df["net_new_highs_pct"].dropna().empty:
-        ax.text(0.5, 0.5, "No H/L data", transform=ax.transAxes,
+    # Tính Net A/D Ratio từ advances/declines
+    if "advances" not in df.columns or "declines" not in df.columns:
+        ax.text(0.5, 0.5, "No A/D data", transform=ax.transAxes,
                 ha="center", va="center", color=C_GREY, fontsize=10)
         return
 
-    dates   = df.index
-    net_pct = df["net_new_highs_pct"].fillna(0)
+    dates    = df.index
+    advances = df["advances"].fillna(0)
+    declines = df["declines"].fillna(0)
+    total    = advances + declines
 
-    bar_colors = np.where(net_pct.values >= 0, C_GREEN, C_RED)
-    ax.bar(dates, net_pct.values, color=bar_colors,
-           alpha=0.72, width=1.5, zorder=2)
+    net_ratio = pd.Series(
+        np.where(total > 0, (advances - declines) / total * 100, np.nan),
+        index=dates,
+    )
+
+    # Bar chart: xanh khi dương, đỏ khi âm
+    bar_colors = np.where(net_ratio.fillna(0).values >= 0, C_GREEN, C_RED)
+    ax.bar(dates, net_ratio.fillna(0).values,
+           color=bar_colors, alpha=0.72, width=1.5, zorder=2)
     ax.axhline(0, color=C_GREY, lw=0.8, zorder=3)
 
-    # 20-day smoothing line
-    smooth = net_pct.rolling(20, min_periods=5).mean()
+    # 20-day MA smoothing
+    smooth = net_ratio.rolling(20, min_periods=3).mean()
     ax.plot(dates, smooth, color=C_DARK_BLUE, lw=1.4,
             label="20D MA", zorder=4)
 
-    ax.set_ylabel("Net New Highs %", fontsize=8, color=C_DARK_BLUE)
-    ax.legend(loc="upper left", fontsize=7, framealpha=0.75)
-    _annotate_last(ax, dates, net_pct, fmt=".1f", suffix="%")
+    # Vùng tham chiếu ±20%
+    ax.axhline( 20, color=C_GREEN, lw=0.7, ls="--", alpha=0.5)
+    ax.axhline(-20, color=C_RED,   lw=0.7, ls="--", alpha=0.5)
 
-    # Secondary: raw counts new_highs / new_lows nếu có
-    if "new_highs" in df.columns and "new_lows" in df.columns:
-        nh = df["new_highs"].fillna(0)
-        nl = df["new_lows"].fillna(0)
-        ax2 = ax.twinx()
-        ax2.plot(dates, nh, color=C_GREEN, lw=0.8,
-                 alpha=0.45, label="New Highs")
-        ax2.plot(dates, nl, color=C_RED,   lw=0.8,
-                 alpha=0.45, label="New Lows")
-        ax2.set_ylabel("Count", fontsize=7, color=C_GREY)
-        ax2.tick_params(axis="y", labelsize=7, labelcolor=C_GREY)
-        ax2.spines[["top"]].set_visible(False)
-        ax2.spines["right"].set_color("#CCCCCC")
-        ax2.legend(loc="upper right", fontsize=7, framealpha=0.75,
-                   ncol=2, columnspacing=0.5)
+    ax.set_ylabel("Net A/D %", fontsize=8, color=C_DARK_BLUE)
+    ax.set_ylim(-105, 105)
+    ax.legend(loc="upper left", fontsize=7, framealpha=0.75)
+    _annotate_last(ax, dates, net_ratio, fmt=".1f", suffix="%")
