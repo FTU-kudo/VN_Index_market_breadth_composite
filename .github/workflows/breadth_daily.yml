@@ -48,6 +48,7 @@ jobs:
       - name: Run pipeline
         env:
           PYTHONUNBUFFERED: "1"
+          VNSTOCK_API_KEY: ${{ secrets.VNSTOCK_API_KEY }}
         run: |
           FULL_FLAG=""
           if [ "${{ github.event.inputs.full_fetch }}" = "true" ] || \
