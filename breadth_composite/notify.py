@@ -32,30 +32,31 @@ logger = logging.getLogger(__name__)
 # Gemini Vision — phân tích chart
 # ---------------------------------------------------------------------------
 
-GEMINI_MODEL   = "gemini-2.0-flash"
+GEMINI_MODEL   = "gemini-3.1-flash-lite"
 GEMINI_API_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
     f"{GEMINI_MODEL}:generateContent"
 )
 
 _ANALYSIS_PROMPT = """
-Bạn là chuyên gia phân tích kỹ thuật thị trường chứng khoán Việt Nam (HOSE).
-Hãy phân tích hình ảnh Market Breadth Dashboard gồm 4 chỉ báo:
-1. % Stocks Above MA20/MA50/MA200 — đánh giá độ rộng thị trường theo xu hướng
-2. Advance-Decline Line (ADL) — sức mạnh tổng thể dòng tiền
-3. McClellan Oscillator & Summation Index — momentum ngắn và trung hạn
-4. Net New 52W Highs/Lows — chất lượng xu hướng
+Bạn là một chuyên gia phân tích kỹ thuật kỳ cựu tại thị trường chứng khoán Việt Nam (HOSE) với 10 năm kinh nghiệm, nổi tiếng với lối phân tích thực chiến, sắc bén và cô đọng.
+Nhiệm vụ của bạn là kết hợp dữ liệu từ hình ảnh "Market Breadth Dashboard" và thông tin số liệu `{metrics_text}` của ngày hôm nay ({today}) để đưa ra một báo cáo phân tích độ rộng thị trường chuyên sâu.
+Hãy liên kết các chỉ báo với nhau (ví dụ: so sánh giữa Momentum, Dòng tiền và Số lượng mã giữ xu hướng) để tìm ra bản chất thực sự của thị trường (Tích lũy, Phân phối, Bùng nổ hay Bẫy tăng giá).
+Yêu cầu Output (Viết bằng tiếng Việt, ngắn gọn, súc tích, tổng dưới 280 từ):
 
-Dữ liệu số hôm nay ({today}):
-{metrics_text}
+🔍 **NHẬN ĐỊNH CHUNG**: (1-2 câu gọi tên chính xác trạng thái cốt lõi của thị trường và xu hướng chủ đạo).
 
-Yêu cầu output (viết bằng tiếng Việt, ngắn gọn súc tích):
-🔍 **NHẬN ĐỊNH CHUNG** (1-2 câu tóm tắt trạng thái thị trường)
-📊 **CHI TIẾT 4 CHỈ BÁO** (mỗi chỉ báo 1 dòng, nêu tín hiệu tích cực/tiêu cực/trung lập)
-⚠️ **RỦI RO CẦN CHÚ Ý** (nếu có divergence hoặc tín hiệu cảnh báo)
-🎯 **GỢI Ý CHIẾN LƯỢC** (1 câu: thận trọng / trung lập / tích cực)
+📊 **CHI TIẾT 4 CHỈ BÁO** (Mỗi chỉ báo gói gọn trong 1 dòng, chỉ rõ trạng thái Tích cực/Tiêu cực/Trung lập + lý do kỹ thuật ngắn):
+1. % Stocks Above MA20/50/200: [Trạng thái] -> [Xu hướng ngắn/trung/dài hạn]
+2. Advance-Decline Line (ADL): [Trạng thái] -> [Sức mạnh dòng tiền tổng thể]
+3. McClellan Oscillator & Summation Index: [Trạng thái] -> [Động lượng ngắn & trung hạn]
+4. Net New 52W Highs/Lows: [Trạng thái] -> [Chất lượng và độ bền của xu hướng]
 
-Giữ toàn bộ output dưới 280 từ. Dùng emoji phù hợp.
+⚠️ **RỦI RO CẦN CHÚ Ý**: (Chỉ ra tín hiệu phân kỳ - Divergence, vùng quá mua/quá bán, hoặc sự suy yếu ngầm nếu có. Nếu không có, ghi "Chưa ghi nhận rủi ro lớn").
+
+🎯 **HÀNH ĐỘNG CHIẾN LƯỢC**: (Gói gọn 1 câu: Đưa ra khuyến nghị vị thế [Thận trọng / Trung lập / Tích cực] kèm hành động ưu tiên cho danh mục).
+
+Lưu ý: Sử dụng emoji phù hợp để tăng tính scannable. Tuyệt đối không viết lan man, tập trung vào tính thực chiến cho nhà đầu tư.
 """
 
 
