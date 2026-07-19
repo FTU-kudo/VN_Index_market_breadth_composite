@@ -73,16 +73,9 @@ def main() -> int:
     )
 
     # 5 — VN-Index overlay (best-effort)
-    vnindex = None
-    try:
-        logger.info("=== STEP 5: VN-Index close ===")
-        from breadth_composite.data_loader import fetch_ohlcv_all
-        vni = fetch_ohlcv_all(["VNINDEX"])
-        if "VNINDEX" in vni:
-            vnindex = vni["VNINDEX"]["close"]
-            logger.info("VN-Index: %d rows", len(vnindex))
-    except Exception as exc:
-        logger.warning("VN-Index fetch skipped: %s", exc)
+    logger.info("=== STEP 5: VN-Index close ===")
+    from breadth_composite.data_loader import fetch_vnindex
+    vnindex = fetch_vnindex()
 
     # 6 — Export
     if args.dry_run:
