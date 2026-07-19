@@ -1,8 +1,8 @@
 # Core data
-vnstock>=3.0.0
+vnstock>=4.0.0
 pandas>=2.0.0
 numpy>=1.24.0
-pyarrow>=14.0.0          # parquet cache
+pyarrow>=14.0.0
 
 # Excel export
 XlsxWriter>=3.1.0
