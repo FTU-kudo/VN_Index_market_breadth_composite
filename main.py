@@ -86,9 +86,20 @@ def main() -> int:
     excel_path = export_excel(breadth, vnindex=vnindex)
     logger.info("Excel: %s", excel_path)
 
-    # 7 — Email
+    # 7 — Render PNG chart
+    logger.info("=== STEP 7: Render chart PNG ===")
+    from breadth_composite.chart_render import render_breadth_chart
+    chart_path = render_breadth_chart(breadth, vnindex=vnindex)
+    logger.info("Chart PNG: %s", chart_path)
+
+    # 8 — Gemini analysis + Telegram notify
+    logger.info("=== STEP 8: Gemini + Telegram ===")
+    from breadth_composite.notify import notify_daily
+    notify_daily(breadth, chart_png_path=chart_path)
+
+    # 9 — Email (disabled by default, keep for future use)
     if args.send_email:
-        logger.info("=== STEP 7: Send email ===")
+        logger.info("=== STEP 9: Send email ===")
         _send_email(excel_path)
 
     logger.info("=== Pipeline complete ===")
