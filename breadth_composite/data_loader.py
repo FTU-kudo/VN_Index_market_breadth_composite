@@ -1,13 +1,15 @@
 """
-data_loader.py — Ticker listing & OHLCV fetcher
-- Lists all HOSE tickers via vnstock
-- Fetches OHLCV history (KBS) với per-ticker retry
-- Persists parquet cache để incremental runs chỉ fetch ngày mới
+data_loader.py — Ticker listing & OHLCV fetcher (vnstock v4 Unified UI)
+- Đăng ký API key tự động từ env var VNSTOCK_API_KEY
+- Dùng Reference.equity.list_by_exchange() để lấy ticker HOSE
+- Dùng Market.equity.ohlcv() cho từng ticker
+- Parquet cache incremental để tránh re-fetch toàn bộ mỗi ngày
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import time
 from datetime import date, timedelta
 from pathlib import Path
@@ -18,13 +20,37 @@ import pandas as pd
 from .config import (
     BACKFILL_YEARS,
     DATA_CACHE_FILENAME,
-    DATA_SOURCE,
     EXCHANGE,
     OUTPUT_DIR,
 )
 
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# vnstock v4 bootstrap — đăng ký API key 1 lần khi module load
+# ---------------------------------------------------------------------------
+
+def _bootstrap_vnstock() -> None:
+    """Đăng ký VNSTOCK_API_KEY từ env nếu có (60 req/phút vs 20 guest)."""
+    api_key = os.environ.get("VNSTOCK_API_KEY", "").strip()
+    if not api_key:
+        logger.warning("VNSTOCK_API_KEY not set — running as guest (20 req/min)")
+        return
+    try:
+        from vnstock import register_user
+        register_user(api_key=api_key)
+        logger.info("vnstock: authenticated (Community tier, 60 req/min)")
+    except Exception as exc:
+        logger.warning("vnstock register_user failed: %s — continuing as guest", exc)
+
+
+_bootstrap_vnstock()
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _cache_path() -> Path:
     p = Path(OUTPUT_DIR)
@@ -46,18 +72,29 @@ def _today() -> str:
 # ---------------------------------------------------------------------------
 
 def get_hose_tickers() -> list[str]:
-    """Return sorted list of all HOSE-listed equity tickers."""
+    """
+    Lấy danh sách tất cả mã cổ phiếu HOSE bằng vnstock v4 Unified UI.
+    Dùng Reference.equity.list_by_exchange() — KBS source.
+    """
     try:
-        from vnstock import listing
-        df = listing().all_symbols()
+        from vnstock import Reference
+        ref = Reference()
+        df = ref.equity.list_by_exchange(exchange=EXCHANGE)
+        # Cột tên mã có thể là 'symbol' hoặc 'ticker'
+        sym_col = next(
+            (c for c in ["symbol", "ticker", "Symbol", "Ticker"] if c in df.columns),
+            df.columns[0],
+        )
         tickers = (
-            df.loc[df["exchange"].str.upper() == EXCHANGE, "symbol"]
+            df[sym_col]
             .dropna()
+            .astype(str)
             .str.upper()
+            .str.strip()
             .sort_values()
             .tolist()
         )
-        logger.info("Listing: %d HOSE tickers fetched", len(tickers))
+        logger.info("Listing (HOSE): %d tickers", len(tickers))
         return tickers
     except Exception as exc:
         logger.error("get_hose_tickers failed: %s", exc)
@@ -70,94 +107,101 @@ def fetch_ohlcv_all(
     start: Optional[str] = None,
     end: Optional[str] = None,
     retry: int = 3,
-    sleep_between: float = 0.15,
+    sleep_between: float = 1.0,   # 60 req/min → ~1s gap an toàn
 ) -> Dict[str, pd.DataFrame]:
     """
-    Fetch OHLCV cho mọi ticker. Trả về dict[ticker -> DataFrame].
-    Tickers lỗi liên tục bị bỏ qua và log lại.
+    Fetch OHLCV cho mọi ticker dùng Market.equity.ohlcv() (vnstock v4).
+    Trả về dict[ticker -> DataFrame(DatetimeIndex, open/high/low/close/volume)].
+    Tickers lỗi liên tục bị bỏ qua.
     """
     start = start or _start_date()
     end   = end   or _today()
 
-    try:
-        from vnstock import stock_historical_data
-    except ImportError:
-        stock_historical_data = None
+    from vnstock import Market
+    market = Market()
 
     results: Dict[str, pd.DataFrame] = {}
 
     for i, ticker in enumerate(tickers, 1):
         for attempt in range(1, retry + 1):
             try:
-                if stock_historical_data is not None:
-                    raw = stock_historical_data(
-                        symbol=ticker,
-                        start_date=start,
-                        end_date=end,
-                        resolution="1D",
-                        type="stock",
-                        beautify=True,
-                        source=DATA_SOURCE,
-                    )
-                else:
-                    from vnstock import Vnstock
-                    raw = (
-                        Vnstock()
-                        .stock(symbol=ticker, source=DATA_SOURCE)
-                        .quote.history(start=start, end=end, interval="1D")
-                    )
-
+                raw = market.equity(ticker).ohlcv(
+                    start=start,
+                    end=end,
+                    interval="1D",
+                )
                 df = _normalise_ohlcv(raw, ticker)
                 if df is not None and not df.empty:
                     results[ticker] = df
-                break
+                break  # thành công
 
             except Exception as exc:
                 if attempt == retry:
                     logger.warning("SKIP %s after %d attempts: %s", ticker, retry, exc)
                 else:
-                    time.sleep(sleep_between * (2 ** attempt))
+                    wait = sleep_between * (2 ** attempt)
+                    logger.debug("Retry %s attempt %d in %.1fs: %s", ticker, attempt, wait, exc)
+                    time.sleep(wait)
 
         if i % 50 == 0:
-            logger.info("  fetched %d / %d tickers ...", i, len(tickers))
+            logger.info("  fetched %d / %d tickers...", i, len(tickers))
+
         time.sleep(sleep_between)
 
-    logger.info("fetch_ohlcv_all done: %d / %d tickers loaded", len(results), len(tickers))
+    logger.info("fetch_ohlcv_all done: %d / %d tickers", len(results), len(tickers))
     return results
 
 
 def _normalise_ohlcv(raw: pd.DataFrame, ticker: str) -> Optional[pd.DataFrame]:
+    """
+    Chuẩn hoá output từ vnstock v4 → schema chuẩn:
+    DatetimeIndex + columns [open, high, low, close, volume].
+    """
     if raw is None or raw.empty:
         return None
 
     df = raw.copy()
 
-    date_candidates = ["time", "date", "tradingDate", "TradingDate", "Date"]
-    date_col = next((c for c in date_candidates if c in df.columns), None)
-    if date_col is None:
-        logger.debug("%s: no date column in %s", ticker, df.columns.tolist())
-        return None
+    # --- Date index ----------------------------------------------------------
+    if isinstance(df.index, pd.DatetimeIndex):
+        df.index.name = "date"
+    else:
+        date_candidates = ["time", "date", "tradingDate", "TradingDate", "Date"]
+        date_col = next((c for c in date_candidates if c in df.columns), None)
+        if date_col is None:
+            # Thử dùng index nếu convert được
+            try:
+                df.index = pd.to_datetime(df.index, errors="raise")
+                df.index.name = "date"
+            except Exception:
+                logger.debug("%s: no usable date column in %s", ticker, df.columns.tolist())
+                return None
+        else:
+            df["date"] = pd.to_datetime(df[date_col], errors="coerce")
+            df = df.dropna(subset=["date"]).set_index("date")
 
-    df["date"] = pd.to_datetime(df[date_col], errors="coerce")
-    df = df.dropna(subset=["date"]).set_index("date").sort_index()
+    df = df.sort_index()
 
+    # --- Rename columns → canonical -----------------------------------------
     col_map = {
-        "open":   ["open",  "Open",  "mở cửa"],
-        "high":   ["high",  "High",  "cao nhất"],
-        "low":    ["low",   "Low",   "thấp nhất"],
-        "close":  ["close", "Close", "đóng cửa", "closePrice"],
-        "volume": ["volume","Volume","khối lượng"],
+        "open":   ["open",   "Open",   "mở cửa",   "openPrice"],
+        "high":   ["high",   "High",   "cao nhất",  "highPrice"],
+        "low":    ["low",    "Low",    "thấp nhất", "lowPrice"],
+        "close":  ["close",  "Close",  "đóng cửa",  "closePrice"],
+        "volume": ["volume", "Volume", "khối lượng","matchingVolume"],
     }
     rename: dict[str, str] = {}
     for canonical, aliases in col_map.items():
         found = next((c for c in aliases if c in df.columns), None)
-        if found:
+        if found and found != canonical:
             rename[found] = canonical
 
     df = df.rename(columns=rename)
+
     required = ["open", "high", "low", "close"]
     if not all(c in df.columns for c in required):
-        logger.debug("%s: missing OHLC columns after normalise", ticker)
+        logger.debug("%s: missing columns %s", ticker,
+                     [c for c in required if c not in df.columns])
         return None
 
     keep = required + (["volume"] if "volume" in df.columns else [])
@@ -166,7 +210,28 @@ def _normalise_ohlcv(raw: pd.DataFrame, ticker: str) -> Optional[pd.DataFrame]:
 
 
 # ---------------------------------------------------------------------------
-# Cache layer
+# VN-Index overlay
+# ---------------------------------------------------------------------------
+
+def fetch_vnindex(start: Optional[str] = None, end: Optional[str] = None) -> Optional[pd.Series]:
+    """Fetch VN-Index close series dùng Market.index.ohlcv() (vnstock v4)."""
+    start = start or _start_date()
+    end   = end   or _today()
+    try:
+        from vnstock import Market
+        raw = Market().index("VNINDEX").ohlcv(start=start, end=end, interval="1D")
+        df  = _normalise_ohlcv(raw, "VNINDEX")
+        if df is not None:
+            logger.info("VN-Index fetched: %d rows", len(df))
+            return df["close"].rename("VNINDEX")
+        return None
+    except Exception as exc:
+        logger.warning("fetch_vnindex failed: %s", exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Cache layer — incremental updates
 # ---------------------------------------------------------------------------
 
 def load_cache() -> Dict[str, pd.DataFrame]:
@@ -196,16 +261,16 @@ def save_cache(data: Dict[str, pd.DataFrame]) -> None:
         frames.append(tmp)
     combined = pd.concat(frames, ignore_index=True)
     combined["date"] = pd.to_datetime(combined["date"])
-    p = _cache_path()
-    combined.to_parquet(p, index=False, engine="pyarrow")
-    logger.info("Cache saved: %d tickers → %s", len(data), p)
+    _cache_path().parent.mkdir(parents=True, exist_ok=True)
+    combined.to_parquet(_cache_path(), index=False, engine="pyarrow")
+    logger.info("Cache saved: %d tickers", len(data))
 
 
 def incremental_fetch(
     cached: Dict[str, pd.DataFrame],
     tickers: list[str],
 ) -> Dict[str, pd.DataFrame]:
-    """Chỉ fetch ngày mới — tickers chưa có cache thì full fetch."""
+    """Chỉ fetch ngày mới hơn ngày cuối trong cache."""
     today = _today()
 
     if cached:
@@ -215,12 +280,11 @@ def incremental_fetch(
         cache_end = _start_date()
 
     if cache_end >= today:
-        logger.info("Cache is current (%s) — skipping fetch", cache_end)
+        logger.info("Cache current (%s) — skip fetch", cache_end)
         return cached
 
     new_start = (pd.Timestamp(cache_end) + timedelta(days=1)).strftime("%Y-%m-%d")
     logger.info("Incremental fetch: %s → %s", new_start, today)
-
     fresh = fetch_ohlcv_all(tickers, start=new_start, end=today)
 
     merged: Dict[str, pd.DataFrame] = {}
