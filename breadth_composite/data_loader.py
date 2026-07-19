@@ -336,6 +336,16 @@ def incremental_fetch(
     tickers: list[str],
 ) -> Dict[str, pd.DataFrame]:
     """Chỉ fetch ngày mới hơn ngày cuối trong cache."""
+    # ── Guard: bỏ qua nếu hôm nay là cuối tuần ──────────────────────────
+    import datetime
+    today_dow = datetime.date.today().weekday()  # 0=Thứ 2 ... 6=Chủ nhật
+    if today_dow >= 5:  # 5=Thứ 7, 6=Chủ nhật
+        logger.info(
+            "Hôm nay là %s — thị trường đóng cửa, bỏ qua incremental fetch.",
+            ["Thứ 2","Thứ 3","Thứ 4","Thứ 5","Thứ 6","Thứ 7","Chủ nhật"][today_dow],
+        )
+        return cached   # trả nguyên cache, không fetch gì cả
+    # ─────────────────────────────────────────────────────────────────────
     today = _today()
 
     if cached:
