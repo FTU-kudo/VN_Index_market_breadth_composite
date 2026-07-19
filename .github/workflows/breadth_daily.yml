@@ -78,13 +78,13 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     timeout-minutes: 5
-    if: |
-      github.event.inputs.send_email != 'true' &&
-      github.event.client_payload.send_email != 'true'
+    if: false    # Disabled — giữ code để dùng lại sau nếu cần
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: main
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
