@@ -171,6 +171,7 @@ def fetch_ohlcv_all(
     end: Optional[str] = None,
     retry: int = 3,
     sleep_between: float = 1.0,   # 60 req/min → ~1s gap an toàn
+    timeout: int = 10, 
 ) -> Dict[str, pd.DataFrame]:
     """
     Fetch OHLCV cho mọi ticker dùng Market.equity.ohlcv() (vnstock v4).
@@ -192,6 +193,7 @@ def fetch_ohlcv_all(
                     start=start,
                     end=end,
                     interval="1D",
+                    timeout=timeout,
                 )
                 df = _normalise_ohlcv(raw, ticker)
                 if df is not None and not df.empty:
@@ -353,6 +355,8 @@ def incremental_fetch(
         start=new_start,
         end=today,
         sleep_between=0.5,   # incremental: chỉ 1-2 ngày/ticker → nhanh hơn
+        retry=1,        # cuối tuần/ngày lỗi → skip ngay, không retry
+        timeout=8,      # imeout ngắn hơn
     )
 
     merged: Dict[str, pd.DataFrame] = {}
