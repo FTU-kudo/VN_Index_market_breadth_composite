@@ -1,0 +1,115 @@
+name: Breadth Composite Daily
+
+on:
+  repository_dispatch:
+    types: [run-breadth]
+
+  schedule:
+    - cron: "30 10 * * 1-5"   # 17:30 ICT (UTC+7), Mon–Fri
+
+  workflow_dispatch:
+    inputs:
+      full_fetch:
+        description: "Force full 6-year re-fetch (true/false)"
+        required: false
+        default: "false"
+      send_email:
+        description: "Send email after export (true/false)"
+        required: false
+        default: "true"
+
+jobs:
+  build:
+    name: Build Breadth Report
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore OHLCV cache
+        uses: actions/cache@v4
+        with:
+          path: output/breadth_data_cache.parquet
+          key: ohlcv-cache-${{ runner.os }}-${{ hashFiles('breadth_composite/config.py') }}
+          restore-keys: |
+            ohlcv-cache-${{ runner.os }}-
+
+      - name: Run pipeline
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          FULL_FLAG=""
+          if [ "${{ github.event.inputs.full_fetch }}" = "true" ] || \
+             [ "${{ github.event.client_payload.full_fetch }}" = "true" ]; then
+            FULL_FLAG="--full"
+          fi
+          python main.py $FULL_FLAG
+
+      - name: Upload Excel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: breadth-report-${{ github.run_id }}
+          path: output/breadth_composite.xlsx
+          retention-days: 30
+
+      - name: Save OHLCV cache
+        uses: actions/cache/save@v4
+        with:
+          path: output/breadth_data_cache.parquet
+          key: ohlcv-cache-${{ runner.os }}-${{ hashFiles('breadth_composite/config.py') }}
+
+  send-email:
+    name: Send Email Report
+    runs-on: ubuntu-latest
+    needs: build
+    timeout-minutes: 5
+    if: |
+      github.event.inputs.send_email != 'false' &&
+      github.event.client_payload.send_email != 'false'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download Excel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: breadth-report-${{ github.run_id }}
+          path: output/
+
+      - name: Send email
+        env:
+          GMAIL_USER:         ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          EMAIL_RECIPIENTS:   ${{ secrets.EMAIL_RECIPIENTS }}
+          PYTHONUNBUFFERED:   "1"
+        run: |
+          python - <<'EOF'
+          import sys, os
+          sys.path.insert(0, ".")
+          excel = "output/breadth_composite.xlsx"
+          if not os.path.exists(excel):
+              print("Excel not found — aborting"); sys.exit(1)
+          from main import _send_email
+          _send_email(excel)
+          EOF
