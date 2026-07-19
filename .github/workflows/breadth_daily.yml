@@ -16,7 +16,7 @@ on:
       send_email:
         description: "Send email after export (true/false)"
         required: false
-        default: "true"
+        default: "false"
 
 jobs:
   build:
@@ -79,8 +79,8 @@ jobs:
     needs: build
     timeout-minutes: 5
     if: |
-      github.event.inputs.send_email != 'false' &&
-      github.event.client_payload.send_email != 'false'
+      github.event.inputs.send_email != 'true' &&
+      github.event.client_payload.send_email != 'true'
 
     steps:
       - name: Checkout
