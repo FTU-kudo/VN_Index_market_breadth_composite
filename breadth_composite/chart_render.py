@@ -1,11 +1,11 @@
 """
 chart_render.py — Render breadth indicators ra PNG để Gemini Vision đọc.
 
-Output: 1 file PNG duy nhất (2x2 grid, 4 subplots) gồm:
-  [0,0] % Stocks above MA20/50/200 + VN-Index (dual axis)
-  [0,1] Advance-Decline Line
+Output: 1 file PNG (2x2 grid):
+  [0,0] % Stocks above MA20/MA50/MA200 + VN-Index overlay (style chart cũ)
+  [0,1] Advance-Decline Line + 50D trend
   [1,0] McClellan Oscillator (bar) + Summation Index (line, dual axis)
-  [1,1] Net New 52W Highs/Lows (bar, green/red) + 20D MA line
+  [1,1] Net Advance/Decline Ratio % (bar + 20D MA)
 """
 
 from __future__ import annotations
@@ -16,9 +16,10 @@ from pathlib import Path
 from typing import Optional
 
 import matplotlib
-matplotlib.use("Agg")  # non-interactive backend, safe cho GitHub Actions
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+import matplotlib.ticker as mticker
 import numpy as np
 import pandas as pd
 
@@ -29,15 +30,18 @@ logger = logging.getLogger(__name__)
 CHART_PNG_FILENAME = "breadth_chart.png"
 
 # ---------------------------------------------------------------------------
-# Palette
+# Palette — giống chart cũ VN_Index_and_MA_ratio_analysis
 # ---------------------------------------------------------------------------
-C_DARK_BLUE = "#1F3864"
-C_MID_BLUE  = "#2E75B6"
-C_ORANGE    = "#ED7D31"
-C_RED       = "#C00000"
-C_GREEN     = "#70AD47"
-C_GREY      = "#A0A0A0"
-C_BG        = "#F9F9F9"
+C_DARK_BLUE  = "#1F3864"
+C_MID_BLUE   = "#2E75B6"
+C_PURPLE     = "#7030A0"   # VN-Index line
+C_CYAN       = "#00BFFF"   # MA20
+C_RED_LINE   = "#FF4444"   # MA50
+C_ORANGE     = "#FFA500"   # MA200
+C_GREEN      = "#70AD47"
+C_RED        = "#C00000"
+C_GREY       = "#A0A0A0"
+C_BG         = "#F9F9F9"
 
 
 # ---------------------------------------------------------------------------
@@ -50,24 +54,9 @@ def render_breadth_chart(
     output_path: Optional[str] = None,
     display_years: int = CHART_DISPLAY_YEARS,
 ) -> str:
-    """
-    Render PNG tổng hợp breadth indicators.
-
-    Parameters
-    ----------
-    breadth       : BreadthFrame từ breadth_calc.compute_all()
-    vnindex       : VN-Index close series (tuỳ chọn, overlay subplot MA)
-    output_path   : override đường dẫn PNG output
-    display_years : số năm hiển thị trên chart
-
-    Returns
-    -------
-    str  đường dẫn tuyệt đối của file PNG
-    """
     out = Path(output_path or f"{OUTPUT_DIR}/{CHART_PNG_FILENAME}")
     out.parent.mkdir(parents=True, exist_ok=True)
 
-    # Trim theo display_years
     cutoff = pd.Timestamp(
         date.today() - timedelta(days=int(display_years * 365.25))
     )
@@ -78,7 +67,7 @@ def render_breadth_chart(
     )
 
     if df.empty:
-        logger.warning("render_breadth_chart: BreadthFrame empty after trim — skipping")
+        logger.warning("BreadthFrame empty after trim — skipping render")
         return str(out)
 
     today_str = date.today().strftime("%d/%m/%Y")
@@ -87,7 +76,7 @@ def render_breadth_chart(
         2, 2,
         figsize=(18, 11),
         facecolor=C_BG,
-        gridspec_kw={"hspace": 0.40, "wspace": 0.30},
+        gridspec_kw={"hspace": 0.42, "wspace": 0.32},
     )
     fig.suptitle(
         f"VN-Index Market Breadth Dashboard — {today_str}",
@@ -97,7 +86,7 @@ def render_breadth_chart(
     _plot_ma_ratios(axes[0, 0], df, vni)
     _plot_adl(axes[0, 1], df)
     _plot_mcclellan(axes[1, 0], df)
-    _plot_high_low(axes[1, 1], df)
+    _plot_net_ad_ratio(axes[1, 1], df)
 
     fig.text(
         0.99, 0.005,
@@ -112,11 +101,10 @@ def render_breadth_chart(
 
 
 # ---------------------------------------------------------------------------
-# Shared axis styling
+# Shared helpers
 # ---------------------------------------------------------------------------
 
 def _fmt_xaxis(ax: plt.Axes) -> None:
-    """Trục X: năm lớn + quý nhỏ."""
     ax.xaxis.set_major_locator(mdates.YearLocator())
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
     ax.xaxis.set_minor_locator(mdates.MonthLocator(bymonth=[4, 7, 10]))
@@ -125,44 +113,41 @@ def _fmt_xaxis(ax: plt.Axes) -> None:
 
 
 def _style_ax(ax: plt.Axes, title: str) -> None:
-    """Style chuẩn cho mọi subplot."""
     ax.set_facecolor("#FFFFFF")
     ax.set_title(title, fontsize=10, fontweight="bold", color=C_DARK_BLUE, pad=7)
     ax.tick_params(axis="y", labelsize=8)
     ax.spines[["top", "right"]].set_visible(False)
     ax.spines[["left", "bottom"]].set_color("#CCCCCC")
-    ax.grid(axis="y", linestyle="--", linewidth=0.5, alpha=0.6, color="#DDDDDD")
+    ax.grid(axis="y", linestyle="--", linewidth=0.5, alpha=0.5, color="#DDDDDD")
     _fmt_xaxis(ax)
 
 
 def _annotate_last(
     ax: plt.Axes,
-    dates: pd.DatetimeIndex,
     values: pd.Series,
     fmt: str = ".1f",
     suffix: str = "",
     offset_x: int = 6,
     offset_y: int = 0,
 ) -> None:
-    """Ghi giá trị cuối lên chart."""
     valid = values.dropna()
     if valid.empty:
         return
     last_val  = valid.iloc[-1]
     last_date = valid.index[-1]
-    color     = C_GREEN if last_val >= 0 else C_RED
+    color = C_GREEN if last_val >= 0 else C_RED
     ax.annotate(
         f"{last_val:{fmt}}{suffix}",
         xy=(last_date, last_val),
         xytext=(offset_x, offset_y),
         textcoords="offset points",
         fontsize=8, fontweight="bold", color=color,
-        bbox=dict(boxstyle="round,pad=0.2", fc="white", ec=color, alpha=0.7),
+        bbox=dict(boxstyle="round,pad=0.2", fc="white", ec=color, alpha=0.8),
     )
 
 
 # ---------------------------------------------------------------------------
-# Subplot [0,0]: % Stocks above MA20 / MA50 / MA200 + VN-Index overlay
+# Subplot [0,0]: % Stocks above MA — style giống chart cũ
 # ---------------------------------------------------------------------------
 
 def _plot_ma_ratios(
@@ -170,48 +155,54 @@ def _plot_ma_ratios(
     df: pd.DataFrame,
     vni: Optional[pd.Series],
 ) -> None:
-    _style_ax(ax, "% Stocks Above MA20 / MA50 / MA200")
+    _style_ax(ax, "Market Breadth: VN-Index & % Stocks Above MA Lines")
 
     dates = df.index
 
-    series_cfg = [
-        ("pct_above_ma20",  C_ORANGE,   "% > MA20",  1.2, 0.85),
-        ("pct_above_ma50",  C_MID_BLUE, "% > MA50",  1.6, 1.00),
-        ("pct_above_ma200", C_RED,      "% > MA200", 1.6, 1.00),
+    # Smooth nhẹ 3-day để bớt noise — giống chart cũ
+    cfg = [
+        ("pct_above_ma20",  C_CYAN,     "% > MA20",  1.0, 0.80),
+        ("pct_above_ma50",  C_RED_LINE, "% > MA50",  1.2, 0.90),
+        ("pct_above_ma200", C_ORANGE,   "% > MA200", 1.4, 1.00),
     ]
-    for col, color, label, lw, alpha in series_cfg:
+    for col, color, label, lw, alpha in cfg:
         if col in df.columns:
-            ax.plot(dates, df[col], color=color, lw=lw,
+            smoothed = df[col].rolling(3, min_periods=1).mean()
+            ax.plot(dates, smoothed, color=color, lw=lw,
                     label=label, alpha=alpha)
 
-    # Vùng tham chiếu 30 / 70
-    ax.axhline(70, color=C_GREEN, lw=0.8, ls="--", alpha=0.55)
-    ax.axhline(30, color=C_RED,   lw=0.8, ls="--", alpha=0.55)
-    ax.fill_between(dates, 70, 100, color=C_GREEN, alpha=0.04)
-    ax.fill_between(dates, 0,  30,  color=C_RED,   alpha=0.04)
-    ax.text(dates[0], 71, "Overbought 70", fontsize=6.5,
-            color=C_GREEN, alpha=0.7, va="bottom")
-    ax.text(dates[0], 31, "Oversold 30",   fontsize=6.5,
-            color=C_RED,   alpha=0.7, va="bottom")
+    # Vùng tham chiếu 20% / 80%
+    ax.axhline(80, color=C_GREEN, lw=0.8, ls="--", alpha=0.55)
+    ax.axhline(60, color=C_GREEN, lw=0.5, ls=":",  alpha=0.35)
+    ax.axhline(40, color=C_RED,   lw=0.5, ls=":",  alpha=0.35)
+    ax.axhline(20, color=C_RED,   lw=0.8, ls="--", alpha=0.55)
+
+    ax.fill_between(dates, 80, 100, color=C_GREEN, alpha=0.05)
+    ax.fill_between(dates, 0,  20,  color=C_RED,   alpha=0.05)
+
+    if len(dates) > 0:
+        ax.text(dates[0], 81, "80%", fontsize=6.5, color=C_GREEN, alpha=0.75)
+        ax.text(dates[0], 21, "20%", fontsize=6.5, color=C_RED,   alpha=0.75)
 
     ax.set_ylim(0, 100)
-    ax.set_ylabel("% Stocks", fontsize=8, color=C_DARK_BLUE)
+    ax.set_ylabel("Percentage (%)", fontsize=8, color=C_DARK_BLUE)
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{int(x)}%"))
     ax.legend(loc="upper left", fontsize=7, framealpha=0.75,
               ncol=3, columnspacing=0.8)
 
-    # Annotate last value của MA50 (chỉ báo chính)
     if "pct_above_ma50" in df.columns:
-        _annotate_last(ax, dates, df["pct_above_ma50"], fmt=".1f", suffix="%")
+        _annotate_last(ax, df["pct_above_ma50"].rolling(3, min_periods=1).mean(),
+                       fmt=".1f", suffix="%")
 
-    # VN-Index overlay trên trục phụ
+    # VN-Index overlay — đường tím đậm giống chart cũ
     if vni is not None and vni.notna().any():
         ax2 = ax.twinx()
-        ax2.plot(dates, vni, color=C_DARK_BLUE, lw=0.9,
-                 ls=":", alpha=0.45, label="VN-Index")
-        ax2.set_ylabel("VN-Index", fontsize=7, color=C_DARK_BLUE, alpha=0.6)
-        ax2.tick_params(axis="y", labelsize=7, labelcolor=C_DARK_BLUE)
-        ax2.spines[["top", "right"]].set_color("#CCCCCC")
-        ax2.spines["left"].set_visible(False)
+        ax2.plot(dates, vni, color=C_PURPLE, lw=1.8,
+                 alpha=0.85, label="VN-Index")
+        ax2.set_ylabel("VN-Index (Index Points)", fontsize=8, color=C_PURPLE)
+        ax2.tick_params(axis="y", labelsize=7, labelcolor=C_PURPLE)
+        ax2.spines[["top"]].set_visible(False)
+        ax2.spines["right"].set_color("#CCCCCC")
         ax2.legend(loc="upper right", fontsize=7, framealpha=0.75)
 
 
@@ -231,22 +222,22 @@ def _plot_adl(ax: plt.Axes, df: pd.DataFrame) -> None:
     adl   = df["adl"]
 
     ax.fill_between(dates, adl, 0,
-                    where=(adl >= 0), color=C_GREEN,
-                    alpha=0.22, interpolate=True)
+                    where=(adl >= 0), color=C_GREEN, alpha=0.22, interpolate=True)
     ax.fill_between(dates, adl, 0,
-                    where=(adl < 0), color=C_RED,
-                    alpha=0.22, interpolate=True)
+                    where=(adl < 0),  color=C_RED,   alpha=0.22, interpolate=True)
     ax.plot(dates, adl, color=C_DARK_BLUE, lw=1.5)
     ax.axhline(0, color=C_GREY, lw=0.8)
 
-    ax.set_ylabel("Cumulative Net A-D", fontsize=8, color=C_DARK_BLUE)
-    _annotate_last(ax, dates, adl, fmt=",.0f")
-
-    # Trend line (50-day rolling mean)
     trend = adl.rolling(50, min_periods=10).mean()
     ax.plot(dates, trend, color=C_ORANGE, lw=1.0, ls="--",
-            alpha=0.7, label="50D trend")
+            alpha=0.75, label="50D Trend")
+
+    ax.set_ylabel("Cumulative Net A-D", fontsize=8, color=C_DARK_BLUE)
+    ax.yaxis.set_major_formatter(
+        mticker.FuncFormatter(lambda x, _: f"{int(x):,}")
+    )
     ax.legend(loc="upper left", fontsize=7, framealpha=0.75)
+    _annotate_last(ax, adl, fmt=",.0f")
 
 
 # ---------------------------------------------------------------------------
@@ -264,22 +255,19 @@ def _plot_mcclellan(ax: plt.Axes, df: pd.DataFrame) -> None:
     dates = df.index
     osc   = df["mcclellan_osc"].fillna(0)
 
-    # Bar: oscillator — xanh dương khi dương, đỏ khi âm
     bar_colors = np.where(osc.values >= 0, C_GREEN, C_RED)
     ax.bar(dates, osc.values, color=bar_colors, alpha=0.72,
            width=1.5, label="Oscillator", zorder=2)
     ax.axhline(0, color=C_GREY, lw=0.8, zorder=3)
 
-    # Signal line: 10-day EMA của oscillator
     signal = osc.ewm(span=10, adjust=False).mean()
     ax.plot(dates, signal, color=C_DARK_BLUE, lw=1.2,
             label="10D EMA", zorder=4)
 
     ax.set_ylabel("McClellan Osc", fontsize=8, color=C_DARK_BLUE)
     ax.legend(loc="upper left", fontsize=7, framealpha=0.75)
-    _annotate_last(ax, dates, osc, fmt=".1f")
+    _annotate_last(ax, osc, fmt=".1f")
 
-    # Summation Index trên trục phụ
     if "mcclellan_sum" in df.columns and df["mcclellan_sum"].dropna().any():
         summ = df["mcclellan_sum"]
         ax2  = ax.twinx()
@@ -294,18 +282,12 @@ def _plot_mcclellan(ax: plt.Axes, df: pd.DataFrame) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Subplot [1,1]: Net New 52W Highs / Lows
+# Subplot [1,1]: Net Advance/Decline Ratio — thay thế 52W H/L
 # ---------------------------------------------------------------------------
 
-def _plot_high_low(ax: plt.Axes, df: pd.DataFrame) -> None:
-    """
-    Thay thế Net New 52W H/L (thường trống) bằng Net A/D Ratio:
-    = (Advances - Declines) / (Advances + Declines) * 100
-    Luôn có data từ ngày đầu tiên, phản ánh sức mạnh dòng tiền hàng ngày.
-    """
+def _plot_net_ad_ratio(ax: plt.Axes, df: pd.DataFrame) -> None:
     _style_ax(ax, "Net Advance / Decline Ratio (%)")
 
-    # Tính Net A/D Ratio từ advances/declines
     if "advances" not in df.columns or "declines" not in df.columns:
         ax.text(0.5, 0.5, "No A/D data", transform=ax.transAxes,
                 ha="center", va="center", color=C_GREY, fontsize=10)
@@ -321,22 +303,22 @@ def _plot_high_low(ax: plt.Axes, df: pd.DataFrame) -> None:
         index=dates,
     )
 
-    # Bar chart: xanh khi dương, đỏ khi âm
     bar_colors = np.where(net_ratio.fillna(0).values >= 0, C_GREEN, C_RED)
     ax.bar(dates, net_ratio.fillna(0).values,
            color=bar_colors, alpha=0.72, width=1.5, zorder=2)
     ax.axhline(0, color=C_GREY, lw=0.8, zorder=3)
 
-    # 20-day MA smoothing
     smooth = net_ratio.rolling(20, min_periods=3).mean()
-    ax.plot(dates, smooth, color=C_DARK_BLUE, lw=1.4,
+    ax.plot(dates, smooth, color=C_DARK_BLUE, lw=1.5,
             label="20D MA", zorder=4)
 
-    # Vùng tham chiếu ±20%
     ax.axhline( 20, color=C_GREEN, lw=0.7, ls="--", alpha=0.5)
     ax.axhline(-20, color=C_RED,   lw=0.7, ls="--", alpha=0.5)
 
-    ax.set_ylabel("Net A/D %", fontsize=8, color=C_DARK_BLUE)
     ax.set_ylim(-105, 105)
+    ax.set_ylabel("Net A/D %", fontsize=8, color=C_DARK_BLUE)
+    ax.yaxis.set_major_formatter(
+        mticker.FuncFormatter(lambda x, _: f"{int(x)}%")
+    )
     ax.legend(loc="upper left", fontsize=7, framealpha=0.75)
-    _annotate_last(ax, dates, net_ratio, fmt=".1f", suffix="%")
+    _annotate_last(ax, net_ratio, fmt=".1f", suffix="%")
