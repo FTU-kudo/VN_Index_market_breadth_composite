@@ -73,20 +73,22 @@ def _today() -> str:
 
 def get_hose_tickers() -> list[str]:
     """
-    Lấy danh sách tất cả mã cổ phiếu HOSE bằng vnstock v4 Unified UI.
-    Dùng Reference.equity.list_by_exchange() — KBS source.
+    Lấy danh sách tất cả mã cổ phiếu HOSE bằng vnstock v4.
+    Dùng Listing().symbols_by_exchange() (VCI source) → filter exchange == HOSE
+    → chỉ lấy type == STOCK.
     """
     try:
-        from vnstock import Reference
-        ref = Reference()
-        df = ref.equity.list_by_exchange(exchange=EXCHANGE)
-        # Cột tên mã có thể là 'symbol' hoặc 'ticker'
-        sym_col = next(
-            (c for c in ["symbol", "ticker", "Symbol", "Ticker"] if c in df.columns),
-            df.columns[0],
-        )
+        from vnstock.explorer.vci.listing import Listing
+        df = Listing().symbols_by_exchange()
+
+        # Filter HOSE + STOCK only
+        if "exchange" in df.columns:
+            df = df[df["exchange"].str.upper() == EXCHANGE]
+        if "type" in df.columns:
+            df = df[df["type"].str.upper() == "STOCK"]
+
         tickers = (
-            df[sym_col]
+            df["symbol"]
             .dropna()
             .astype(str)
             .str.upper()
@@ -96,10 +98,10 @@ def get_hose_tickers() -> list[str]:
         )
         logger.info("Listing (HOSE): %d tickers", len(tickers))
         return tickers
+
     except Exception as exc:
         logger.error("get_hose_tickers failed: %s", exc)
         raise
-
 
 def fetch_ohlcv_all(
     tickers: list[str],
