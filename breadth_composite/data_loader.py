@@ -348,7 +348,12 @@ def incremental_fetch(
 
     new_start = (pd.Timestamp(cache_end) + timedelta(days=1)).strftime("%Y-%m-%d")
     logger.info("Incremental fetch: %s → %s", new_start, today)
-    fresh = fetch_ohlcv_all(tickers, start=new_start, end=today)
+    fresh = fetch_ohlcv_all(
+        tickers,
+        start=new_start,
+        end=today,
+        sleep_between=0.5,   # incremental: chỉ 1-2 ngày/ticker → nhanh hơn
+    )
 
     merged: Dict[str, pd.DataFrame] = {}
     for t in set(cached) | set(fresh):
