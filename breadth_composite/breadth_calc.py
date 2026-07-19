@@ -39,10 +39,10 @@ def compute_all(ohlcv: OHLCVDict) -> pd.DataFrame:
     close = _build_close_matrix(ohlcv)
     logger.info("Close matrix: %d dates × %d tickers", *close.shape)
 
-    ma_frame  = _pct_above_ma(close)
-    ad_frame  = _advance_decline(close)
-    mc_frame  = _mcclellan(ad_frame["advances"], ad_frame["declines"])
-    hl_frame  = _high_low(close)
+    ma_frame = _pct_above_ma(close)
+    ad_frame = _advance_decline(close)
+    mc_frame = _mcclellan(ad_frame["advances"], ad_frame["declines"])
+    hl_frame = _high_low(close)
 
     breadth = pd.concat([ma_frame, ad_frame, mc_frame, hl_frame], axis=1).sort_index()
     breadth.index.name = "date"
@@ -79,8 +79,8 @@ def _pct_above_ma(close: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def _advance_decline(close: pd.DataFrame) -> pd.DataFrame:
-    chg     = close.diff()
-    traded  = close.notna() & close.shift(1).notna()
+    chg    = close.diff()
+    traded = close.notna() & close.shift(1).notna()
 
     advances  = ((chg > 0) & traded).sum(axis=1).astype(int)
     declines  = ((chg < 0) & traded).sum(axis=1).astype(int)
@@ -107,8 +107,8 @@ def _mcclellan(advances: pd.Series, declines: pd.Series) -> pd.DataFrame:
         index=advances.index,
     )
 
-    fast       = ratio_net.ewm(span=MCCLELLAN_FAST_EMA, adjust=False, min_periods=5).mean()
-    slow       = ratio_net.ewm(span=MCCLELLAN_SLOW_EMA, adjust=False, min_periods=5).mean()
+    fast      = ratio_net.ewm(span=MCCLELLAN_FAST_EMA, adjust=False, min_periods=5).mean()
+    slow      = ratio_net.ewm(span=MCCLELLAN_SLOW_EMA, adjust=False, min_periods=5).mean()
     oscillator = fast - slow
     summation  = oscillator.cumsum() + MCCLELLAN_SUMMATION_SEED
 
@@ -119,12 +119,16 @@ def _mcclellan(advances: pd.Series, declines: pd.Series) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# 4. 52-Week High / Low
+# 4. 52-Week High / Low — min_periods giảm xuống để có data sớm hơn
 # ---------------------------------------------------------------------------
 
 def _high_low(close: pd.DataFrame) -> pd.DataFrame:
-    rolling_max = close.rolling(HIGH_LOW_WINDOW, min_periods=HIGH_LOW_WINDOW).max()
-    rolling_min = close.rolling(HIGH_LOW_WINDOW, min_periods=HIGH_LOW_WINDOW).min()
+    # BUG FIX: min_periods = HIGH_LOW_WINDOW/2 thay vì HIGH_LOW_WINDOW
+    # → có data sau ~3 tháng thay vì phải chờ đủ 6 tháng
+    min_p = max(20, HIGH_LOW_WINDOW // 2)
+
+    rolling_max = close.rolling(HIGH_LOW_WINDOW, min_periods=min_p).max()
+    rolling_min = close.rolling(HIGH_LOW_WINDOW, min_periods=min_p).min()
 
     has_history = close.notna() & rolling_max.notna()
     new_highs   = ((close >= rolling_max) & has_history).sum(axis=1).astype(int)
@@ -159,6 +163,18 @@ def _build_close_matrix(ohlcv: OHLCVDict) -> pd.DataFrame:
     close = pd.DataFrame(series)
     close.index = pd.to_datetime(close.index)
     close = close.sort_index()
+
+    # BUG FIX 1: Lọc giá âm hoặc bằng 0 — không hợp lệ
+    close = close.where(close > 0)
+
+    # BUG FIX 2: Lọc spike bất thường — thay đổi >50%/ngày bằng NaN
+    # Đây là nguyên nhân gây đường thẳng đứng trên chart
+    pct_chg = close.pct_change().abs()
+    close   = close.where(pct_chg < 0.50)
+
+    # BUG FIX 3: Forward-fill tối đa 3 ngày để tránh gap ngắn (ngày lễ, suspend)
+    # nhưng không forward-fill quá lâu tránh tạo tín hiệu giả
+    close = close.ffill(limit=3)
 
     # Bỏ ngày không phải trading (gần như toàn NaN)
     min_tickers = max(10, int(len(series) * 0.05))
