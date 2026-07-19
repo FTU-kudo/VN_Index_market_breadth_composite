@@ -47,8 +47,11 @@ jobs:
 
       - name: Run pipeline
         env:
-          PYTHONUNBUFFERED: "1"
-          VNSTOCK_API_KEY: ${{ secrets.VNSTOCK_API_KEY }}
+          PYTHONUNBUFFERED:  "1"
+          VNSTOCK_API_KEY:   ${{ secrets.VNSTOCK_API_KEY }}
+          GEMINI_API_KEY:    ${{ secrets.GEMINI_API_KEY }}
+          TELEGRAM_TOKEN:    ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_ID:       ${{ secrets.TELEGRAM_ID }}
         run: |
           FULL_FLAG=""
           if [ "${{ github.event.inputs.full_fetch }}" = "true" ] || \
