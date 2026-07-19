@@ -14,8 +14,8 @@ from typing import List
 DATA_SOURCE = "KBS"
 EXCHANGE    = "HOSE"
 
-BACKFILL_YEARS      = 6
-CHART_DISPLAY_YEARS = 5
+BACKFILL_YEARS      = 3
+CHART_DISPLAY_YEARS = 3
 
 # ---------------------------------------------------------------------------
 # Moving-Average Windows
@@ -41,7 +41,7 @@ MCCLELLAN_SUMMATION_SEED = 0
 # 52-Week High / Low
 # ---------------------------------------------------------------------------
 
-HIGH_LOW_WINDOW = 252
+HIGH_LOW_WINDOW = 126
 
 # ---------------------------------------------------------------------------
 # Output
