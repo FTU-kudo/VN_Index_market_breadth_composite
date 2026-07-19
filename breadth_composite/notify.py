@@ -88,7 +88,7 @@ def _build_metrics_text(breadth: pd.DataFrame) -> str:
         f"- McClellan Sum : {_fmt('mcclellan_sum', ',.0f')}",
         f"- New Highs : {_fmt('new_highs', '.0f')}",
         f"- New Lows  : {_fmt('new_lows', '.0f')}",
-        f"- Net H/L % : {_fmt('net_new_highs_pct')}%",
+        f"- Net A/D Ratio: {_fmt('net_new_highs_pct')}%",
         f"- Advances  : {_fmt('advances', '.0f')}",
         f"- Declines  : {_fmt('declines', '.0f')}",
     ]
