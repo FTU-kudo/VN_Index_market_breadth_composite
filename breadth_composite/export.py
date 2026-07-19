@@ -15,7 +15,6 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Optional
 
-import numpy as np
 import pandas as pd
 import xlsxwriter
 
@@ -72,9 +71,12 @@ def _add_data_sheet(wb: xlsxwriter.Workbook, df: pd.DataFrame) -> None:
     date_fmt = wb.add_format({"num_format": "DD/MM/YYYY", "border": 1})
     num_fmt  = wb.add_format({"num_format": "0.00", "border": 1})
     int_fmt  = wb.add_format({"num_format": "0",    "border": 1})
-    alt_num  = wb.add_format({"num_format": "0.00", "border": 1, "bg_color": C_LIGHT_GREY})
-    alt_int  = wb.add_format({"num_format": "0",    "border": 1, "bg_color": C_LIGHT_GREY})
-    alt_date = wb.add_format({"num_format": "DD/MM/YYYY", "border": 1, "bg_color": C_LIGHT_GREY})
+    alt_num  = wb.add_format({"num_format": "0.00", "border": 1,
+                               "bg_color": C_LIGHT_GREY})
+    alt_int  = wb.add_format({"num_format": "0",    "border": 1,
+                               "bg_color": C_LIGHT_GREY})
+    alt_date = wb.add_format({"num_format": "DD/MM/YYYY", "border": 1,
+                               "bg_color": C_LIGHT_GREY})
 
     int_cols = {"advances", "declines", "unchanged", "new_highs", "new_lows"}
     cols     = ["date"] + df.columns.tolist()
@@ -86,8 +88,8 @@ def _add_data_sheet(wb: xlsxwriter.Workbook, df: pd.DataFrame) -> None:
         ws.set_column(i, i, max(12, len(col) + 2))
 
     for row_i, (idx, row) in enumerate(df.iterrows(), start=1):
-        alt    = (row_i % 2 == 0)
-        d_fmt  = alt_date if alt else date_fmt
+        alt   = (row_i % 2 == 0)
+        d_fmt = alt_date if alt else date_fmt
         ws.write_datetime(row_i, 0, idx.to_pydatetime(), d_fmt)
         for col_i, col in enumerate(df.columns, start=1):
             val = row[col]
@@ -95,9 +97,11 @@ def _add_data_sheet(wb: xlsxwriter.Workbook, df: pd.DataFrame) -> None:
                 ws.write_blank(row_i, col_i, None)
                 continue
             if col in int_cols:
-                ws.write_number(row_i, col_i, int(val), alt_int if alt else int_fmt)
+                ws.write_number(row_i, col_i, int(val),
+                                alt_int if alt else int_fmt)
             else:
-                ws.write_number(row_i, col_i, float(val), alt_num if alt else num_fmt)
+                ws.write_number(row_i, col_i, float(val),
+                                alt_num if alt else num_fmt)
 
     ws.freeze_panes(1, 1)
     ws.autofilter(0, 0, len(df), len(cols) - 1)
@@ -112,7 +116,7 @@ def _add_ma_chart_sheet(
     df: pd.DataFrame,
     vnindex: Optional[pd.Series],
 ) -> None:
-    ws    = wb.add_worksheet("chart_ma")
+    ws = wb.add_worksheet("chart_ma")
     ws.hide_gridlines(2)
 
     hdr_fmt  = wb.add_format({"bold": True, "bg_color": C_DARK_BLUE,
@@ -128,23 +132,25 @@ def _add_ma_chart_sheet(
 
     for ri, (idx, row) in enumerate(df.iterrows(), start=1):
         ws.write_datetime(ri, 0, idx.to_pydatetime(), date_fmt)
-        for ci, col in enumerate(["pct_above_ma20", "pct_above_ma50", "pct_above_ma200"], start=1):
+        for ci, col in enumerate(
+            ["pct_above_ma20", "pct_above_ma50", "pct_above_ma200"], start=1
+        ):
             v = row.get(col)
-            if not pd.isna(v):
+            if v is not None and not pd.isna(v):
                 ws.write_number(ri, ci, float(v))
         if vnindex is not None:
             v = vnindex.iloc[ri - 1] if ri - 1 < len(vnindex) else None
             if v is not None and not pd.isna(v):
                 ws.write_number(ri, 4, float(v))
 
-    n      = len(df) + 1
-    sname  = "chart_ma"
-    combo  = wb.add_chart({"type": "line"})
+    n     = len(df) + 1
+    sname = "chart_ma"
+    combo = wb.add_chart({"type": "line"})
 
-    for col_name, colour, label, ci in [
-        ("pct_above_ma20",  C_ORANGE,   "% > MA20",  1),
-        ("pct_above_ma50",  C_MID_BLUE, "% > MA50",  2),
-        ("pct_above_ma200", C_RED,      "% > MA200", 3),
+    for label, colour, ci in [
+        ("% > MA20",  C_ORANGE,   1),
+        ("% > MA50",  C_MID_BLUE, 2),
+        ("% > MA200", C_RED,      3),
     ]:
         combo.add_series({
             "name":       label,
@@ -196,9 +202,11 @@ def _add_adl_chart_sheet(wb: xlsxwriter.Workbook, df: pd.DataFrame) -> None:
 
     for ri, (idx, row) in enumerate(df.iterrows(), start=1):
         ws.write_datetime(ri, 0, idx.to_pydatetime(), date_fmt)
-        for ci, col in enumerate(["adl", "mcclellan_osc", "mcclellan_sum"], start=1):
+        for ci, col in enumerate(
+            ["adl", "mcclellan_osc", "mcclellan_sum"], start=1
+        ):
             v = row.get(col)
-            if not pd.isna(v):
+            if v is not None and not pd.isna(v):
                 ws.write_number(ri, ci, float(v))
 
     n     = len(df) + 1
@@ -250,9 +258,11 @@ def _add_hl_chart_sheet(wb: xlsxwriter.Workbook, df: pd.DataFrame) -> None:
 
     for ri, (idx, row) in enumerate(df.iterrows(), start=1):
         ws.write_datetime(ri, 0, idx.to_pydatetime(), date_fmt)
-        for ci, col in enumerate(["net_new_highs_pct", "new_highs", "new_lows"], start=1):
+        for ci, col in enumerate(
+            ["net_new_highs_pct", "new_highs", "new_lows"], start=1
+        ):
             v = row.get(col)
-            if not pd.isna(v):
+            if v is not None and not pd.isna(v):
                 ws.write_number(ri, ci, float(v))
 
     n     = len(df) + 1
