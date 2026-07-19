@@ -73,35 +73,96 @@ def _today() -> str:
 
 def get_hose_tickers() -> list[str]:
     """
-    Lấy danh sách tất cả mã cổ phiếu HOSE bằng vnstock v4.
-    Dùng Listing().symbols_by_exchange() (VCI source) → filter exchange == HOSE
-    → chỉ lấy type == STOCK.
+    Lấy danh sách tất cả mã cổ phiếu HOSE.
+    Strategy:
+      1. symbols_by_exchange() → filter HOSE + STOCK (log columns để debug)
+      2. Fallback: symbols_by_group("HOSE") nếu bước 1 ra 0 kết quả
+      3. Fallback cuối: all_symbols() (toàn thị trường, không filter sàn)
     """
-    try:
-        from vnstock.explorer.vci.listing import Listing
-        df = Listing().symbols_by_exchange()
+    from vnstock.explorer.vci.listing import Listing
+    listing = Listing()
 
-        # Filter HOSE + STOCK only
-        if "exchange" in df.columns:
-            df = df[df["exchange"].str.upper() == EXCHANGE]
-        if "type" in df.columns:
-            df = df[df["type"].str.upper() == "STOCK"]
+    # ------------------------------------------------------------------ #
+    # Attempt 1: symbols_by_exchange — filter động theo giá trị thực tế  #
+    # ------------------------------------------------------------------ #
+    try:
+        df = listing.symbols_by_exchange()
+        logger.info(
+            "symbols_by_exchange columns: %s | sample exchange values: %s",
+            df.columns.tolist(),
+            df["exchange"].unique()[:10].tolist() if "exchange" in df.columns else "N/A",
+        )
+
+        if "exchange" in df.columns and "type" in df.columns:
+            # Normalize về upper để khớp cả "HOSE", "HoSE", "HSX"
+            ex_upper   = df["exchange"].astype(str).str.upper()
+            type_upper = df["type"].astype(str).str.upper()
+
+            # HOSE có thể được gọi là "HOSE" hoặc "HSX" tuỳ source
+            hose_mask  = ex_upper.isin(["HOSE", "HSX"])
+            stock_mask = type_upper == "STOCK"
+            filtered   = df.loc[hose_mask & stock_mask, "symbol"]
+
+        elif "exchange" in df.columns:
+            ex_upper  = df["exchange"].astype(str).str.upper()
+            hose_mask = ex_upper.isin(["HOSE", "HSX"])
+            filtered  = df.loc[hose_mask, "symbol"]
+
+        else:
+            # Không có cột exchange → lấy tất cả STOCK
+            filtered = df.loc[
+                df["type"].astype(str).str.upper() == "STOCK", "symbol"
+            ] if "type" in df.columns else df["symbol"]
 
         tickers = (
-            df["symbol"]
-            .dropna()
-            .astype(str)
-            .str.upper()
-            .str.strip()
-            .sort_values()
-            .tolist()
+            filtered.dropna()
+            .astype(str).str.upper().str.strip()
+            .sort_values().unique().tolist()
         )
-        logger.info("Listing (HOSE): %d tickers", len(tickers))
-        return tickers
+        logger.info("Attempt 1 (symbols_by_exchange): %d tickers", len(tickers))
+
+        if len(tickers) > 0:
+            return tickers
 
     except Exception as exc:
-        logger.error("get_hose_tickers failed: %s", exc)
-        raise
+        logger.warning("Attempt 1 failed: %s", exc)
+
+    # ------------------------------------------------------------------ #
+    # Attempt 2: symbols_by_group("HOSE")                                #
+    # ------------------------------------------------------------------ #
+    try:
+        series  = listing.symbols_by_group("HOSE")
+        tickers = (
+            series.dropna()
+            .astype(str).str.upper().str.strip()
+            .sort_values().unique().tolist()
+        )
+        logger.info("Attempt 2 (symbols_by_group HOSE): %d tickers", len(tickers))
+        if len(tickers) > 0:
+            return tickers
+    except Exception as exc:
+        logger.warning("Attempt 2 failed: %s", exc)
+
+    # ------------------------------------------------------------------ #
+    # Attempt 3: all_symbols() — toàn thị trường, không filter sàn       #
+    # ------------------------------------------------------------------ #
+    try:
+        df      = listing.all_symbols()
+        tickers = (
+            df["symbol"].dropna()
+            .astype(str).str.upper().str.strip()
+            .sort_values().unique().tolist()
+        )
+        logger.info("Attempt 3 (all_symbols fallback): %d tickers", len(tickers))
+        if len(tickers) > 0:
+            return tickers
+    except Exception as exc:
+        logger.warning("Attempt 3 failed: %s", exc)
+
+    raise RuntimeError(
+        "get_hose_tickers: tất cả 3 attempts đều thất bại — "
+        "kiểm tra vnstock version và network trong GitHub Actions"
+    )
 
 def fetch_ohlcv_all(
     tickers: list[str],
