@@ -52,6 +52,12 @@ Yêu cầu Output (Viết bằng tiếng Việt, ngắn gọn, súc tích, tổn
 3. McClellan Oscillator & Summation Index: [Trạng thái] -> [Động lượng ngắn & trung hạn]
 4. Net New 52W Highs/Lows: [Trạng thái] -> [Chất lượng và độ bền của xu hướng]
 
+⏱ *NGẮN HẠN (1-4 tuần)*
+[1 câu nhận định momentum và rủi ro gần]
+
+📅 *DÀI HẠN (3-6 tháng)*
+[1 câu nhận định xu hướng lớn từ ADL và MA200]
+
 ⚠️ **RỦI RO CẦN CHÚ Ý**: (Chỉ ra tín hiệu phân kỳ - Divergence, vùng quá mua/quá bán, hoặc sự suy yếu ngầm nếu có. Nếu không có, ghi "Chưa ghi nhận rủi ro lớn").
 
 🎯 **HÀNH ĐỘNG CHIẾN LƯỢC**: (Gói gọn 1 câu: Đưa ra khuyến nghị vị thế [Thận trọng / Trung lập / Tích cực] kèm hành động ưu tiên cho danh mục).
@@ -163,16 +169,17 @@ def send_telegram(
     image_path: Optional[str] = None,
 ) -> bool:
     """
-    Gửi message (và tuỳ chọn ảnh) qua Telegram Bot API.
+    Gửi ảnh + phân tích trong MỘT tin nhắn Telegram duy nhất.
 
-    Parameters
-    ----------
-    text       : nội dung tin nhắn (Markdown)
-    image_path : đường dẫn PNG đính kèm (tuỳ chọn)
+    Logic:
+      - Có ảnh → sendPhoto với caption (Telegram giới hạn 1024 ký tự)
+        → text được truncate vừa đủ 1024, KHÔNG gửi tin thứ 2
+      - Không có ảnh / ảnh lỗi → sendMessage với text (giới hạn 4096 ký tự)
+      - Parse mode Markdown cho cả hai trường hợp
 
     Returns
     -------
-    bool  True nếu thành công
+    bool  True nếu gửi thành công
     """
     token   = os.environ.get("TELEGRAM_TOKEN", "").strip()
     chat_id = os.environ.get("TELEGRAM_ID", "").strip()
@@ -183,34 +190,51 @@ def send_telegram(
 
     base_url = f"https://api.telegram.org/bot{token}"
 
-    # Gửi ảnh kèm caption nếu có
     if image_path and Path(image_path).exists():
+        # Truncate caption tại đúng 1024 ký tự — không split, không tin thứ 2
+        caption = text[:1024]
         try:
             with open(image_path, "rb") as img:
                 resp = requests.post(
                     f"{base_url}/sendPhoto",
                     data={
                         "chat_id":    chat_id,
-                        "caption":    text[:1024],   # Telegram caption limit
+                        "caption":    caption,
                         "parse_mode": "Markdown",
                     },
                     files={"photo": img},
                     timeout=30,
                 )
             resp.raise_for_status()
-            logger.info("Telegram photo sent (caption %d chars)", len(text))
-
-            # Nếu text dài hơn caption limit → gửi phần còn lại thành message riêng
-            if len(text) > 1024:
-                _send_text_message(base_url, chat_id, text[1024:])
-
+            logger.info(
+                "Telegram: sendPhoto OK (caption %d / %d chars)",
+                len(caption), len(text),
+            )
             return True
 
         except Exception as exc:
-            logger.warning("Telegram sendPhoto failed: %s — fallback to text", exc)
+            logger.warning(
+                "Telegram sendPhoto failed (%s) — falling back to text-only", exc
+            )
 
-    # Fallback: chỉ gửi text
-    return _send_text_message(base_url, chat_id, text)
+    # Fallback: text-only message, truncate tại 4096
+    try:
+        resp = requests.post(
+            f"{base_url}/sendMessage",
+            json={
+                "chat_id":    chat_id,
+                "text":       text[:4096],
+                "parse_mode": "Markdown",
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        logger.info("Telegram: sendMessage OK (%d chars)", len(text[:4096]))
+        return True
+
+    except Exception as exc:
+        logger.error("Telegram sendMessage failed: %s", exc)
+        return False
 
 
 def _send_text_message(base_url: str, chat_id: str, text: str) -> bool:
