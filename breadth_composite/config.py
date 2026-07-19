@@ -14,8 +14,8 @@ from typing import List
 DATA_SOURCE = "KBS"
 EXCHANGE    = "HOSE"
 
-BACKFILL_YEARS      = 3
-CHART_DISPLAY_YEARS = 3
+BACKFILL_YEARS      = 6
+CHART_DISPLAY_YEARS = 5
 
 # ---------------------------------------------------------------------------
 # Moving-Average Windows
