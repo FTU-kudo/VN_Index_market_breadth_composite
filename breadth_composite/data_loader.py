@@ -181,9 +181,9 @@ def fetch_ohlcv_all(
     *,
     start: Optional[str] = None,
     end: Optional[str] = None,
-    retry: int = 3,
-    sleep_between: float = 1.0,   # 60 req/min → ~1s gap an toàn
-    timeout: int = 10, 
+    retry: int = 2,
+    sleep_between: float = 0.8,
+    timeout: int = 10,        # giữ trong signature nhưng KHÔNG truyền vào .ohlcv()
 ) -> Dict[str, pd.DataFrame]:
     """
     Fetch OHLCV cho mọi ticker dùng Market.equity.ohlcv() (vnstock v4).
@@ -191,7 +191,15 @@ def fetch_ohlcv_all(
     Tickers lỗi liên tục bị bỏ qua.
     """
     start = start or _start_date()
-    end   = end   or _today()
+    end   = end   or _today()    # _today() tự lùi về T6 nếu cuối tuần
+
+    # Guard: nếu start > end (ví dụ cache đã cập nhật đến T6, hôm nay CN)
+    # thì không cần fetch gì cả
+    if start > end:
+        logger.info(
+            "start (%s) > end (%s) — không có ngày mới cần fetch", start, end
+        )
+        return {}
 
     from vnstock import Market
     market = Market()
@@ -201,11 +209,11 @@ def fetch_ohlcv_all(
     for i, ticker in enumerate(tickers, 1):
         for attempt in range(1, retry + 1):
             try:
+                # KHÔNG truyền timeout — vnstock v4 không nhận keyword này
                 raw = market.equity(ticker).ohlcv(
                     start=start,
                     end=end,
                     interval="1D",
-                    timeout=timeout,
                 )
                 df = _normalise_ohlcv(raw, ticker)
                 if df is not None and not df.empty:
@@ -214,10 +222,14 @@ def fetch_ohlcv_all(
 
             except Exception as exc:
                 if attempt == retry:
-                    logger.warning("SKIP %s after %d attempts: %s", ticker, retry, exc)
+                    logger.warning(
+                        "SKIP %s after %d attempts: %s", ticker, retry, exc
+                    )
                 else:
-                    wait = sleep_between * (2 ** attempt)
-                    logger.debug("Retry %s attempt %d in %.1fs: %s", ticker, attempt, wait, exc)
+                    wait = sleep_between * attempt  # linear backoff
+                    logger.debug(
+                        "Retry %s attempt %d in %.1fs: %s", ticker, attempt, wait, exc
+                    )
                     time.sleep(wait)
 
         if i % 50 == 0:
@@ -225,7 +237,9 @@ def fetch_ohlcv_all(
 
         time.sleep(sleep_between)
 
-    logger.info("fetch_ohlcv_all done: %d / %d tickers", len(results), len(tickers))
+    logger.info(
+        "fetch_ohlcv_all done: %d / %d tickers", len(results), len(tickers)
+    )
     return results
 
 
