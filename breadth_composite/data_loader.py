@@ -64,7 +64,19 @@ def _start_date() -> str:
 
 
 def _today() -> str:
-    return date.today().strftime("%Y-%m-%d")
+    """
+    Trả về ngày giao dịch gần nhất (không phải cuối tuần).
+    Nếu hôm nay là T7 → trả về T6.
+    Nếu hôm nay là CN → trả về T6.
+    Ngày thường → trả về hôm nay.
+    """
+    today = date.today()
+    dow   = today.weekday()  # 0=T2 ... 5=T7, 6=CN
+    if dow == 5:             # Thứ 7 → lùi 1 ngày
+        today = today - timedelta(days=1)
+    elif dow == 6:           # Chủ nhật → lùi 2 ngày
+        today = today - timedelta(days=2)
+    return today.strftime("%Y-%m-%d")
 
 
 # ---------------------------------------------------------------------------
