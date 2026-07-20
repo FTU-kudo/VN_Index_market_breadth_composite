@@ -45,24 +45,42 @@ def main() -> int:
         load_cache, save_cache,
     )
 
-    # 1 — Ticker list
-    logger.info("=== STEP 1: Ticker list ===")
-    tickers = get_hose_tickers()
-    logger.info("Universe: %d tickers", len(tickers))
-
-    # 2 — OHLCV
-    logger.info("=== STEP 2: OHLCV fetch ===")
-    if args.full:
-        from breadth_composite.data_loader import fetch_ohlcv_all
-        ohlcv = fetch_ohlcv_all(tickers)
+    # 0 — Weekend guard toàn pipeline
+    import datetime
+    dow = datetime.date.today().weekday()
+    if dow >= 5 and not args.full:
+        logger.info(
+            "Hôm nay là %s — thị trường đóng, pipeline dùng cache cũ.",
+            ["T2","T3","T4","T5","T6","T7","CN"][dow],
+        )
+        # Vẫn chạy compute + export + notify nhưng skip fetch
+        from breadth_composite import load_cache, compute_all, export_excel
+        from breadth_composite.data_loader import fetch_vnindex
+        cached = load_cache()
+        if not cached:
+            logger.error("Không có cache — cần chạy full fetch ngày thường trước")
+            return 1
+        ohlcv = cached
     else:
-        ohlcv = incremental_fetch(load_cache(), tickers)
-    logger.info("OHLCV loaded: %d tickers", len(ohlcv))
+        # 1 — Ticker list
+        logger.info("=== STEP 1: Ticker list ===")
+        tickers = get_hose_tickers()
+        logger.info("Universe: %d tickers", len(tickers))
 
-    # 3 — Save cache
-    logger.info("=== STEP 3: Save cache ===")
-    save_cache(ohlcv)
+        # 2 — OHLCV
+        logger.info("=== STEP 2: OHLCV fetch ===")
+        if args.full:
+            from breadth_composite.data_loader import fetch_ohlcv_all
+            ohlcv = fetch_ohlcv_all(tickers)
+        else:
+            ohlcv = incremental_fetch(load_cache(), tickers)
+        logger.info("OHLCV loaded: %d tickers", len(ohlcv))
 
+        # 3 — Save cache
+        logger.info("=== STEP 3: Save cache ===")
+        save_cache(ohlcv)
+
+  
     # 4 — Compute breadth
     logger.info("=== STEP 4: Compute breadth ===")
     breadth = compute_all(ohlcv)
