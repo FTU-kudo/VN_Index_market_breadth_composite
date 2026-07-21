@@ -46,11 +46,12 @@ Yêu cầu Output (Viết bằng tiếng Việt, ngắn gọn, súc tích, tổn
 
 🔍 **NHẬN ĐỊNH CHUNG**: (1-2 câu gọi tên chính xác trạng thái cốt lõi của thị trường và xu hướng chủ đạo).
 
-📊 **CHI TIẾT 4 CHỈ BÁO** (Mỗi chỉ báo gói gọn trong 1 dòng, chỉ rõ trạng thái Tích cực/Tiêu cực/Trung lập + lý do kỹ thuật ngắn):
-1. % Stocks Above MA20/50/200: [Trạng thái] -> [Xu hướng ngắn/trung/dài hạn]
-2. Advance-Decline Line (ADL): [Trạng thái] -> [Sức mạnh dòng tiền tổng thể]
-3. McClellan Oscillator & Summation Index: [Trạng thái] -> [Động lượng ngắn & trung hạn]
-4. Net New 52W Highs/Lows: [Trạng thái] -> [Chất lượng và độ bền của xu hướng]
+📊 **CHI TIẾT 5 CHỈ BÁO** (Mỗi chỉ báo gói gọn trong 1 dòng, chỉ rõ trạng thái Tích cực/Tiêu cực/Trung lập + lý do kỹ thuật ngắn):
+1. % Stocks Above MA20/50/200: [Trạng thái] → [Xu hướng ngắn/trung/dài hạn]
+2. Advance-Decline Line (ADL): [Trạng thái] → [Sức mạnh dòng tiền tổng thể]
+3. McClellan Oscillator & Summation Index: [Trạng thái] → [Động lượng ngắn hạn và trung hạn]
+4. Net New 52W Highs/Lows: [Trạng thái] → [Chất lượng và độ bền của xu hướng]
+5. Net A/D Ratio: [Trạng thái] → [Số mã giảm / tăng và nhận định chất lượng thị trường]
 
 ⏱ *NGẮN HẠN (1-4 tuần)*
 [1 câu nhận định momentum và rủi ro gần]
