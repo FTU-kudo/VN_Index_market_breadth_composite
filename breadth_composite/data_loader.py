@@ -26,6 +26,30 @@ from .config import (
 
 logger = logging.getLogger(__name__)
 
+# Rate Limit Exceeded solver
+from collections import deque
+
+class RateLimiter:
+    """Limit API calls to `max_calls` per `period` seconds."""
+    def __init__(self, max_calls: int = 50, period: float = 60.0):
+        self.max_calls = max_calls
+        self.period = period
+        self.calls = deque()
+
+    def wait(self):
+        now = time.monotonic()
+        # Remove timestamps older than period
+        while self.calls and self.calls[0] <= now - self.period:
+            self.calls.popleft()
+        if len(self.calls) >= self.max_calls:
+            sleep_time = self.calls[0] + self.period - now + 0.1
+            logger.debug("Rate limit approaching, sleeping %.1fs", sleep_time)
+            time.sleep(sleep_time)
+            # Recursive call to re-check after sleep
+            self.wait()
+        else:
+            self.calls.append(now)
+
 
 # ---------------------------------------------------------------------------
 # vnstock v4 bootstrap — đăng ký API key 1 lần khi module load
@@ -182,34 +206,27 @@ def fetch_ohlcv_all(
     start: Optional[str] = None,
     end: Optional[str] = None,
     retry: int = 2,
-    sleep_between: float = 0.8,
-    timeout: int = 10,        # giữ trong signature nhưng KHÔNG truyền vào .ohlcv()
+    sleep_between: float = 0.8,    # kept for backwards compatibility but not used inside
+    timeout: int = 10,
 ) -> Dict[str, pd.DataFrame]:
-    """
-    Fetch OHLCV cho mọi ticker dùng Market.equity.ohlcv() (vnstock v4).
-    Trả về dict[ticker -> DataFrame(DatetimeIndex, open/high/low/close/volume)].
-    Tickers lỗi liên tục bị bỏ qua.
-    """
     start = start or _start_date()
-    end   = end   or _today()    # _today() tự lùi về T6 nếu cuối tuần
+    end   = end   or _today()
 
-    # Guard: nếu start > end (ví dụ cache đã cập nhật đến T6, hôm nay CN)
-    # thì không cần fetch gì cả
     if start > end:
-        logger.info(
-            "start (%s) > end (%s) — không có ngày mới cần fetch", start, end
-        )
+        logger.info("start (%s) > end (%s) — no new days to fetch", start, end)
         return {}
 
     from vnstock import Market
     market = Market()
-
     results: Dict[str, pd.DataFrame] = {}
+
+    # --- Rate limiter: 50 requests per minute ---
+    limiter = RateLimiter(max_calls=50, period=60.0)
 
     for i, ticker in enumerate(tickers, 1):
         for attempt in range(1, retry + 1):
             try:
-                # KHÔNG truyền timeout — vnstock v4 không nhận keyword này
+                limiter.wait()                     # <-- enforce rate limit
                 raw = market.equity(ticker).ohlcv(
                     start=start,
                     end=end,
@@ -218,28 +235,25 @@ def fetch_ohlcv_all(
                 df = _normalise_ohlcv(raw, ticker)
                 if df is not None and not df.empty:
                     results[ticker] = df
-                break  # thành công
-
+                break
             except Exception as exc:
+                err_msg = str(exc).lower()
+                # Check for rate-limit error and wait longer
+                if "rate limit" in err_msg:
+                    backoff = 60.0
+                    logger.warning("Rate limit hit for %s, sleeping %ds", ticker, backoff)
+                    time.sleep(backoff)
                 if attempt == retry:
-                    logger.warning(
-                        "SKIP %s after %d attempts: %s", ticker, retry, exc
-                    )
+                    logger.warning("SKIP %s after %d attempts: %s", ticker, retry, exc)
                 else:
-                    wait = sleep_between * attempt  # linear backoff
-                    logger.debug(
-                        "Retry %s attempt %d in %.1fs: %s", ticker, attempt, wait, exc
-                    )
+                    wait = sleep_between * attempt
+                    logger.debug("Retry %s attempt %d in %.1fs: %s", ticker, attempt, wait, exc)
                     time.sleep(wait)
 
         if i % 50 == 0:
             logger.info("  fetched %d / %d tickers...", i, len(tickers))
 
-        time.sleep(sleep_between)
-
-    logger.info(
-        "fetch_ohlcv_all done: %d / %d tickers", len(results), len(tickers)
-    )
+    logger.info("fetch_ohlcv_all done: %d / %d tickers", len(results), len(tickers))
     return results
 
 
