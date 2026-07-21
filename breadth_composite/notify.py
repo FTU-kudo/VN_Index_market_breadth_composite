@@ -238,13 +238,12 @@ def _escape_markdown_v2(text: str) -> str:
 
 def _send_text_message(base_url: str, chat_id: str, text: str) -> bool:
     """
-    Escape MarkdownV2, split into chunks ≤ 4096 chars, and send.
-    Returns True if all chunks were sent successfully.
+    Escape MarkdownV2, split into chunks, send.
+    If MarkdownV2 fails, fall back to plain text (no parse_mode).
     """
-    # Escape while keeping **bold** intact
+    # First attempt: MarkdownV2 with bold preserved
     escaped = _escape_markdown_v2(text)
-
-    # Chunking (safe margin: 4000 chars to allow for possible length increase)
+    # Split into chunks (safe margin)
     MAX_LEN = 4000
     chunks = [escaped[i: i + MAX_LEN] for i in range(0, len(escaped), MAX_LEN)]
     success = True
@@ -261,13 +260,36 @@ def _send_text_message(base_url: str, chat_id: str, text: str) -> bool:
                 timeout=30,
             )
             resp.raise_for_status()
-            logger.info("Telegram message sent (%d chars)", len(chunk))
+            logger.info("Telegram MarkdownV2 sent (%d chars)", len(chunk))
         except Exception as exc:
-            logger.error("Telegram sendMessage failed: %s", exc)
-            success = False
+            # Log detailed error (including Telegram response if available)
+            logger.error(
+                "MarkdownV2 send failed: %s. Response: %s",
+                exc,
+                exc.response.text if hasattr(exc, 'response') and exc.response else ''
+            )
+            # Fallback: send the **original, unescaped** text as plain text
+            logger.info("Retrying as plain text without parse_mode...")
+            try:
+                for plain_chunk in [
+                    text[i: i + 4000] for i in range(0, len(text), 4000)
+                ]:
+                    resp = requests.post(
+                        f"{base_url}/sendMessage",
+                        json={
+                            "chat_id": chat_id,
+                            "text":    plain_chunk,
+                        },
+                        timeout=30,
+                    )
+                    resp.raise_for_status()
+                    logger.info("Plain text sent (%d chars)", len(plain_chunk))
+            except Exception as fallback_exc:
+                logger.error("Plain text fallback also failed: %s", fallback_exc)
+                success = False
+            break  # on first chunk failure, fall back once and stop
 
     return success
-
 # ---------------------------------------------------------------------------
 # Master notify function — gọi từ main.py
 # ---------------------------------------------------------------------------
