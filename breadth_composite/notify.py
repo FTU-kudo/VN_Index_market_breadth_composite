@@ -47,16 +47,16 @@ Yêu cầu Output (Viết bằng tiếng Việt, ngắn gọn, súc tích, tổn
 🔍 **NHẬN ĐỊNH CHUNG**: (1-2 câu gọi tên chính xác trạng thái cốt lõi của thị trường và xu hướng chủ đạo).
 
 📊 **CHI TIẾT 5 CHỈ BÁO** (Mỗi chỉ báo gói gọn trong 1 dòng, chỉ rõ trạng thái Tích cực/Tiêu cực/Trung lập + lý do kỹ thuật ngắn):
-1. % Stocks Above MA20/50/200: [Trạng thái] → [Xu hướng ngắn/trung/dài hạn]
-2. Advance-Decline Line (ADL): [Trạng thái] → [Sức mạnh dòng tiền tổng thể]
-3. McClellan Oscillator & Summation Index: [Trạng thái] → [Động lượng ngắn hạn và trung hạn]
-4. Net New 52W Highs/Lows: [Trạng thái] → [Chất lượng và độ bền của xu hướng]
-5. Net A/D Ratio: [Trạng thái] → [Số mã giảm / tăng và nhận định chất lượng thị trường]
+1. **% Stocks Above MA20/50/200:** [Trạng thái] → [Xu hướng ngắn/trung/dài hạn]
+2. **Advance-Decline Line (ADL):** [Trạng thái] → [Sức mạnh dòng tiền tổng thể]
+3. **McClellan Oscillator & Summation Index:** [Trạng thái] → [Động lượng ngắn hạn và trung hạn]
+4. **Net New 52W Highs/Lows:** [Trạng thái] → [Chất lượng và độ bền của xu hướng]
+5. **Net A/D Ratio:** [Trạng thái] → [Số mã giảm / tăng và nhận định chất lượng thị trường]
 
-⏱ *NGẮN HẠN (1-4 tuần)*
+⏱ **NGẮN HẠN (1-4 tuần)**
 [1 câu nhận định momentum và rủi ro gần]
 
-📅 *DÀI HẠN (3-6 tháng)*
+📅 **DÀI HẠN (3-6 tháng)**
 [1 câu nhận định xu hướng lớn từ ADL và MA200]
 
 ⚠️ **RỦI RO CẦN CHÚ Ý**: (Chỉ ra tín hiệu phân kỳ - Divergence, vùng quá mua/quá bán, hoặc sự suy yếu ngầm nếu có. Nếu không có, ghi "Chưa ghi nhận rủi ro lớn").
@@ -169,12 +169,7 @@ def send_telegram(
     text: str,
     image_path: Optional[str] = None,
 ) -> bool:
-    """
-    Gửi 2 message riêng biệt:
-      1. sendPhoto (ảnh chart, không caption)
-      2. sendMessage (toàn bộ text phân tích, max 4096 ký tự)
-    Tách ra để text không bị giới hạn 1024 ký tự của caption.
-    """
+    """Gửi ảnh + text phân tích qua Telegram (MarkdownV2, bold support)."""
     token   = os.environ.get("TELEGRAM_TOKEN", "").strip()
     chat_id = os.environ.get("TELEGRAM_ID", "").strip()
 
@@ -201,30 +196,57 @@ def send_telegram(
             logger.warning("Telegram sendPhoto failed: %s", exc)
             success = False
 
-    # Message 2: text phân tích đầy đủ (4096 ký tự)
-    try:
-        resp = requests.post(
-            f"{base_url}/sendMessage",
-            json={
-                "chat_id":    chat_id,
-                "text":       text[:4096],
-                "parse_mode": "Markdown",
-            },
-            timeout=30,
-        )
-        resp.raise_for_status()
-        logger.info("Telegram: sendMessage OK (%d chars)", len(text[:4096]))
-    except Exception as exc:
-        logger.error("Telegram sendMessage failed: %s", exc)
+    # Message 2: text phân tích – use the safe sender
+    if not _send_text_message(base_url, chat_id, text):
         success = False
 
     return success
 
+# Send bold text for importance headlines
+import re
+
+def _escape_markdown_v2(text: str) -> str:
+    """
+    Escape all MarkdownV2 special characters except intentional '**bold**'.
+    Telegram's MarkdownV2 spec:
+      Characters to escape: _ * [ ] ( ) ~ ` > # + - = | { } . !
+    We temporarily replace **bold** sections with placeholders,
+    escape the rest, and then restore the original bold markers.
+    """
+    # Find all occurrences of **something**
+    bold_re = re.compile(r'\*\*(.+?)\*\*')
+    placeholders: list[str] = []
+
+    def _replace(m: re.Match) -> str:
+        placeholders.append(m.group(0))          # e.g., "**NHẬN ĐỊNH CHUNG**"
+        return f"\x00BOLD{len(placeholders) - 1}\x00"
+
+    # Step 1: Replace bold spans with placeholders
+    escaped = bold_re.sub(_replace, text)
+
+    # Step 2: Escape every special character everywhere else
+    special_chars = r'_*[]()~`>#+-=|{}.!'
+    for char in special_chars:
+        escaped = escaped.replace(char, '\\' + char)
+
+    # Step 3: Restore the bold placeholders (which are safe)
+    for i, orig in enumerate(placeholders):
+        escaped = escaped.replace(f"\x00BOLD{i}\x00", orig)
+
+    return escaped
+
 
 def _send_text_message(base_url: str, chat_id: str, text: str) -> bool:
-    """Gửi tin nhắn text thuần, tự cắt nếu vượt 4096 ký tự."""
-    MAX_LEN = 4096
-    chunks  = [text[i: i + MAX_LEN] for i in range(0, len(text), MAX_LEN)]
+    """
+    Escape MarkdownV2, split into chunks ≤ 4096 chars, and send.
+    Returns True if all chunks were sent successfully.
+    """
+    # Escape while keeping **bold** intact
+    escaped = _escape_markdown_v2(text)
+
+    # Chunking (safe margin: 4000 chars to allow for possible length increase)
+    MAX_LEN = 4000
+    chunks = [escaped[i: i + MAX_LEN] for i in range(0, len(escaped), MAX_LEN)]
     success = True
 
     for chunk in chunks:
@@ -234,7 +256,7 @@ def _send_text_message(base_url: str, chat_id: str, text: str) -> bool:
                 json={
                     "chat_id":    chat_id,
                     "text":       chunk,
-                    "parse_mode": "Markdown",
+                    "parse_mode": "MarkdownV2",
                 },
                 timeout=30,
             )
@@ -245,7 +267,6 @@ def _send_text_message(base_url: str, chat_id: str, text: str) -> bool:
             success = False
 
     return success
-
 
 # ---------------------------------------------------------------------------
 # Master notify function — gọi từ main.py
