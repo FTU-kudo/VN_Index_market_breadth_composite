@@ -63,7 +63,7 @@ Yêu cầu Output (Viết bằng tiếng Việt, ngắn gọn, súc tích, tổn
 
 🎯 **HÀNH ĐỘNG CHIẾN LƯỢC**: (Gói gọn 1 câu: Đưa ra khuyến nghị vị thế [Thận trọng / Trung lập / Tích cực] kèm hành động ưu tiên cho danh mục).
 
-Lưu ý: Sử dụng emoji phù hợp để tăng tính scannable. Tuyệt đối không viết lan man, tập trung vào tính thực chiến cho nhà đầu tư.
+Lưu ý: Sử dụng emoji phù hợp để tăng tính scannable. Tuyệt đối không viết lan man, tập trung vào tính thực chiến cho nhà đầu tư. Khi viết nhận định, tuyệt đối giữ nguyên vị trí các dấu hoa thị (**) trong prompt này; không được in đậm.
 """
 
 
