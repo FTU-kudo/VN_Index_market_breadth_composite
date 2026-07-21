@@ -205,58 +205,46 @@ def send_telegram(
 # Send bold text for importance headlines
 import re
 
-def _escape_markdown_v2(text: str) -> str:
+def _text_to_html(text: str) -> str:
     """
-    Escape MarkdownV2 special characters except intentional '**bold**'.
-    Uses re.DOTALL so bold can span multiple lines.
+    Convert '**bold**' to '<b>bold</b>' and escape HTML special chars elsewhere.
     """
-    bold_re = re.compile(r'\*\*(.+?)\*\*', re.DOTALL)
-    placeholders: list[str] = []
+    # 1. Escape '<', '>', '&' in the whole text first
+    text = text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
 
-    def _replace(m: re.Match) -> str:
-        placeholders.append(m.group(0))
-        return f"\x00BOLD{len(placeholders) - 1}\x00"
+    # 2. Replace '**...**' with '<b>...</b>' (greedy? we use DOTALL + non-greedy)
+    text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text, flags=re.DOTALL)
 
-    # 1. Replace bold with placeholders
-    escaped = bold_re.sub(_replace, text)
-
-    # 2. Escape all special characters everywhere else
-    special_chars = r'_*[]()~`>#+-=|{}.!'
-    for char in special_chars:
-        escaped = escaped.replace(char, '\\' + char)
-
-    # 3. Restore bold markers
-    for i, orig in enumerate(placeholders):
-        escaped = escaped.replace(f"\x00BOLD{i}\x00", orig)
-
-    return escaped
+    return text
 
 
 def _send_text_message(base_url: str, chat_id: str, text: str) -> bool:
     """
-    Try MarkdownV2 with bold; if it fails, fall back to plain text.
-    Logs the exact Telegram error for debugging.
+    Send message with HTML parse mode. Fall back to plain text on failure,
+    and in the fallback strip the ** markers to avoid confusion.
     """
-    escaped = _escape_markdown_v2(text)
     MAX_LEN = 4000
-    chunks = [escaped[i: i + MAX_LEN] for i in range(0, len(escaped), MAX_LEN)]
     success = True
+
+    # Prepare HTML version
+    html_text = _text_to_html(text)
+    chunks = [html_text[i: i + MAX_LEN] for i in range(0, len(html_text), MAX_LEN)]
 
     for chunk in chunks:
         try:
             resp = requests.post(
                 f"{base_url}/sendMessage",
                 json={
-                    "chat_id":    chat_id,
-                    "text":       chunk,
-                    "parse_mode": "MarkdownV2",
+                    "chat_id": chat_id,
+                    "text": chunk,
+                    "parse_mode": "HTML",
                 },
                 timeout=30,
             )
             resp.raise_for_status()
-            logger.info("MarkdownV2 sent (%d chars)", len(chunk))
+            logger.info("HTML sent (%d chars)", len(chunk))
         except Exception as exc:
-            # Log the full Telegram response for diagnosis
+            # Log the error
             response_text = ""
             if hasattr(exc, 'response') and exc.response is not None:
                 try:
@@ -264,14 +252,15 @@ def _send_text_message(base_url: str, chat_id: str, text: str) -> bool:
                 except Exception:
                     response_text = "Could not read response"
             logger.error(
-                "MarkdownV2 failed: %s\nResponse body: %s", exc, response_text
+                "HTML parse failed: %s\nResponse body: %s", exc, response_text
             )
 
-            # Fallback: plain text (no parse_mode)
+            # Fallback: plain text, but remove ** markers so it's clean
             logger.info("Falling back to plain text…")
-            try:
-                plain_chunks = [text[i: i + 4000] for i in range(0, len(text), 4000)]
-                for plain in plain_chunks:
+            plain_text = text.replace('**', '')   # strip all asterisks
+            plain_chunks = [plain_text[i: i + 4000] for i in range(0, len(plain_text), 4000)]
+            for plain in plain_chunks:
+                try:
                     resp = requests.post(
                         f"{base_url}/sendMessage",
                         json={"chat_id": chat_id, "text": plain},
@@ -279,10 +268,10 @@ def _send_text_message(base_url: str, chat_id: str, text: str) -> bool:
                     )
                     resp.raise_for_status()
                     logger.info("Plain text sent (%d chars)", len(plain))
-            except Exception as fallback_exc:
-                logger.error("Plain text fallback also failed: %s", fallback_exc)
-                success = False
-            break   # Stop trying further chunks after first failure
+                except Exception as fallback_exc:
+                    logger.error("Plain text fallback also failed: %s", fallback_exc)
+                    success = False
+            break   # Stop after first failed chunk
 
     return success
   
