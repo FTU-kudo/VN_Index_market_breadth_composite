@@ -50,6 +50,8 @@ class RateLimiter:
         else:
             self.calls.append(now)
 
+# Global rate limiter – max 45 calls per 60 seconds (safe margin)
+_global_limiter = RateLimiter(max_calls=45, period=60.0)
 
 # ---------------------------------------------------------------------------
 # vnstock v4 bootstrap — đăng ký API key 1 lần khi module load
@@ -122,6 +124,7 @@ def get_hose_tickers() -> list[str]:
     # Attempt 1: symbols_by_exchange — filter động theo giá trị thực tế  #
     # ------------------------------------------------------------------ #
     try:
+        _global_limiter.wait()
         df = listing.symbols_by_exchange()
         logger.info(
             "symbols_by_exchange columns: %s | sample exchange values: %s",
@@ -167,6 +170,7 @@ def get_hose_tickers() -> list[str]:
     # Attempt 2: symbols_by_group("HOSE")                                #
     # ------------------------------------------------------------------ #
     try:
+        _global_limiter.wait()
         series  = listing.symbols_by_group("HOSE")
         tickers = (
             series.dropna()
@@ -183,6 +187,7 @@ def get_hose_tickers() -> list[str]:
     # Attempt 3: all_symbols() — toàn thị trường, không filter sàn       #
     # ------------------------------------------------------------------ #
     try:
+        _global_limiter.wait()
         df      = listing.all_symbols()
         tickers = (
             df["symbol"].dropna()
@@ -221,7 +226,7 @@ def fetch_ohlcv_all(
     results: Dict[str, pd.DataFrame] = {}
 
     # --- Rate limiter: 50 requests per minute ---
-    limiter = RateLimiter(max_calls=50, period=60.0)
+    _global_limiter.wait()
 
     for i, ticker in enumerate(tickers, 1):
         for attempt in range(1, retry + 1):
@@ -324,6 +329,7 @@ def fetch_vnindex(start: Optional[str] = None, end: Optional[str] = None) -> Opt
     end   = end   or _today()
     try:
         from vnstock import Market
+        _global_limiter.wait()
         raw = Market().index("VNINDEX").ohlcv(start=start, end=end, interval="1D")
         df  = _normalise_ohlcv(raw, "VNINDEX")
         if df is not None:
