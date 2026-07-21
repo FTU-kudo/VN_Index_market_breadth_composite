@@ -300,7 +300,7 @@ def notify_daily(
         analysis = f"❌ Lỗi phân tích Gemini: {exc}"
 
     header = (
-        f"📈 *VN-Index Breadth Report*\n"
+        f"📈 **VN-Index Breadth Report**\n"
         f"📅 {today_str}\n"
         f"{'─' * 32}\n\n"
     )
