@@ -329,15 +329,17 @@ def _normalise_ohlcv(raw: pd.DataFrame, ticker: str) -> Optional[pd.DataFrame]:
 def fetch_vnindex(start: Optional[str] = None, end: Optional[str] = None) -> Optional[pd.Series]:
     """Fetch VN-Index close series dùng Market.index.ohlcv() (vnstock v4)."""
     start = start or _start_date()
-    end = end or _last_trading_day()
+    end   = end   or _last_trading_day()
     try:
         from vnstock import Market
-        _global_limiter.wait()
         raw = Market().index("VNINDEX").ohlcv(start=start, end=end, interval="1D")
         df  = _normalise_ohlcv(raw, "VNINDEX")
         if df is not None:
-            logger.info("VN-Index fetched: %d rows", len(df))
-            return df["close"].rename("VNINDEX")
+            series = df["close"].rename("VNINDEX")
+            # Dedup: giữ ngày cuối nếu trùng
+            series = series[~series.index.duplicated(keep="last")]
+            logger.info("VN-Index fetched: %d rows", len(series))
+            return series
         return None
     except Exception as exc:
         logger.warning("fetch_vnindex failed: %s", exc)
