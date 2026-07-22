@@ -90,17 +90,20 @@ def _start_date() -> str:
 
 
 def _today() -> str:
+    """Ngày hôm nay thực tế — dùng để so sánh cache."""
+    return date.today().strftime("%Y-%m-%d")
+
+
+def _last_trading_day() -> str:
     """
-    Trả về ngày giao dịch gần nhất (không phải cuối tuần).
-    Nếu hôm nay là T7 → trả về T6.
-    Nếu hôm nay là CN → trả về T6.
-    Ngày thường → trả về hôm nay.
+    Ngày giao dịch gần nhất — dùng làm end date khi fetch.
+    T7 → T6, CN → T6, ngày thường → hôm nay.
     """
     today = date.today()
-    dow   = today.weekday()  # 0=T2 ... 5=T7, 6=CN
-    if dow == 5:             # Thứ 7 → lùi 1 ngày
+    dow   = today.weekday()
+    if dow == 5:        # Thứ 7
         today = today - timedelta(days=1)
-    elif dow == 6:           # Chủ nhật → lùi 2 ngày
+    elif dow == 6:      # Chủ nhật
         today = today - timedelta(days=2)
     return today.strftime("%Y-%m-%d")
 
@@ -215,7 +218,7 @@ def fetch_ohlcv_all(
     timeout: int = 10,
 ) -> Dict[str, pd.DataFrame]:
     start = start or _start_date()
-    end   = end   or _today()
+    end = end or _last_trading_day()
 
     if start > end:
         logger.info("start (%s) > end (%s) — no new days to fetch", start, end)
@@ -326,7 +329,7 @@ def _normalise_ohlcv(raw: pd.DataFrame, ticker: str) -> Optional[pd.DataFrame]:
 def fetch_vnindex(start: Optional[str] = None, end: Optional[str] = None) -> Optional[pd.Series]:
     """Fetch VN-Index close series dùng Market.index.ohlcv() (vnstock v4)."""
     start = start or _start_date()
-    end   = end   or _today()
+    end = end or _last_trading_day()
     try:
         from vnstock import Market
         _global_limiter.wait()
