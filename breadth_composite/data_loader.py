@@ -214,27 +214,31 @@ def fetch_ohlcv_all(
     start: Optional[str] = None,
     end: Optional[str] = None,
     retry: int = 2,
-    sleep_between: float = 0.8,    # kept for backwards compatibility but not used inside
+    sleep_between: float = 0.8,
     timeout: int = 10,
 ) -> Dict[str, pd.DataFrame]:
+    """
+    Fetch OHLCV cho mọi ticker dùng Market.equity.ohlcv() (vnstock v4).
+    Trả về dict[ticker -> DataFrame(DatetimeIndex, open/high/low/close/volume)].
+    Tickers lỗi liên tục bị bỏ qua.
+    """
     start = start or _start_date()
-    end = end or _last_trading_day()
+    end   = end   or _last_trading_day()
 
+    # Guard: không có ngày mới cần fetch
     if start > end:
-        logger.info("start (%s) > end (%s) — no new days to fetch", start, end)
+        logger.info("start (%s) > end (%s) — bỏ qua fetch", start, end)
         return {}
+
+    logger.info("fetch_ohlcv_all: %d tickers | %s → %s", len(tickers), start, end)
 
     from vnstock import Market
     market = Market()
     results: Dict[str, pd.DataFrame] = {}
 
-    # --- Rate limiter: 50 requests per minute ---
-    _global_limiter.wait()
-
     for i, ticker in enumerate(tickers, 1):
         for attempt in range(1, retry + 1):
             try:
-                limiter.wait()                     # <-- enforce rate limit
                 raw = market.equity(ticker).ohlcv(
                     start=start,
                     end=end,
@@ -244,22 +248,19 @@ def fetch_ohlcv_all(
                 if df is not None and not df.empty:
                     results[ticker] = df
                 break
+
             except Exception as exc:
-                err_msg = str(exc).lower()
-                # Check for rate-limit error and wait longer
-                if "rate limit" in err_msg:
-                    backoff = 60.0
-                    logger.warning("Rate limit hit for %s, sleeping %ds", ticker, backoff)
-                    time.sleep(backoff)
                 if attempt == retry:
-                    logger.warning("SKIP %s after %d attempts: %s", ticker, retry, exc)
+                    logger.warning(
+                        "SKIP %s after %d attempts: %s", ticker, retry, exc
+                    )
                 else:
-                    wait = sleep_between * attempt
-                    logger.debug("Retry %s attempt %d in %.1fs: %s", ticker, attempt, wait, exc)
-                    time.sleep(wait)
+                    time.sleep(sleep_between * attempt)
 
         if i % 50 == 0:
             logger.info("  fetched %d / %d tickers...", i, len(tickers))
+
+        time.sleep(sleep_between)
 
     logger.info("fetch_ohlcv_all done: %d / %d tickers", len(results), len(tickers))
     return results
