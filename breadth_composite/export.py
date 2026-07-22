@@ -42,11 +42,12 @@ def export_excel(
 
     cutoff    = pd.Timestamp(date.today() - timedelta(days=int(CHART_DISPLAY_YEARS * 365.25)))
     chart_df  = breadth.loc[breadth.index >= cutoff].copy()
-    chart_vni = (
-        vnindex.loc[vnindex.index >= cutoff].reindex(chart_df.index)
-        if vnindex is not None else None
-    )
-
+    if vnindex is not None:
+        vni_clean = vnindex[~vnindex.index.duplicated(keep="last")]
+        chart_vni = vni_clean.loc[vni_clean.index >= cutoff].reindex(chart_df.index)
+    else:
+        chart_vni = None
+      
     wb = xlsxwriter.Workbook(str(out), {"nan_inf_to_errors": True})
     _add_data_sheet(wb, breadth)
     _add_ma_chart_sheet(wb, chart_df, chart_vni)
