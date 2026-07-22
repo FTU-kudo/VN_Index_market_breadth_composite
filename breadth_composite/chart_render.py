@@ -61,10 +61,11 @@ def render_breadth_chart(
         date.today() - timedelta(days=int(display_years * 365.25))
     )
     df  = breadth.loc[breadth.index >= cutoff].copy()
-    vni = (
-        vnindex.loc[vnindex.index >= cutoff].reindex(df.index)
-        if vnindex is not None else None
-    )
+    if vnindex is not None:
+        vni_clean = vnindex[~vnindex.index.duplicated(keep="last")]
+        vni = vni_clean.loc[vni_clean.index >= cutoff].reindex(df.index)
+    else:
+        vni = None
 
     if df.empty:
         logger.warning("BreadthFrame empty after trim — skipping render")
