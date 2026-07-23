@@ -1,22 +1,24 @@
-"""
-data_loader.py — Ticker listing & OHLCV fetcher (vnstock v4 Unified UI)
-- Đăng ký API key tự động từ env var VNSTOCK_API_KEY
-- Dùng Reference.equity.list_by_exchange() để lấy ticker HOSE
-- Dùng Market.equity.ohlcv() cho từng ticker
-- Parquet cache incremental để tránh re-fetch toàn bộ mỗi ngày
-"""
+# data_loader.py — Ticker listing & OHLCV fetcher (vnstock v4 Unified UI)
+# - Đăng ký API key tự động từ env var VNSTOCK_API_KEY
+# - Dùng Reference.equity.list_by_exchange() để lấy ticker HOSE
+# - Dùng Market.equity.ohlcv() cho từng ticker
+# - Parquet cache incremental để tránh re-fetch toàn bộ mỗi ngày
 
 from __future__ import annotations
 
 import logging
 import os
 import time
+from collections import deque
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Dict, Optional
 
 import pandas as pd
 
+# ---------------------------------------------------------------------------
+# Config (import từ module config của bạn – giữ nguyên)
+# ---------------------------------------------------------------------------
 from .config import (
     BACKFILL_YEARS,
     DATA_CACHE_FILENAME,
@@ -26,9 +28,10 @@ from .config import (
 
 logger = logging.getLogger(__name__)
 
-# Rate Limit Exceeded solver
-from collections import deque
 
+# ============================================================================
+#  RATE LIMITER (dùng chung cho mọi request đến vnstock)
+# ============================================================================
 class RateLimiter:
     """Limit API calls to `max_calls` per `period` seconds."""
     def __init__(self, max_calls: int = 50, period: float = 60.0):
@@ -45,18 +48,19 @@ class RateLimiter:
             sleep_time = self.calls[0] + self.period - now + 0.1
             logger.debug("Rate limit approaching, sleeping %.1fs", sleep_time)
             time.sleep(sleep_time)
-            # Recursive call to re-check after sleep
+            # Recursive call to re-check after sleep (could be many waits)
             self.wait()
         else:
             self.calls.append(now)
 
-# Global rate limiter – max 45 calls per 60 seconds (safe margin)
+
+# Giới hạn an toàn: 45 requests/phút (dưới ngưỡng 60 của Community)
 _global_limiter = RateLimiter(max_calls=45, period=60.0)
 
-# ---------------------------------------------------------------------------
-# vnstock v4 bootstrap — đăng ký API key 1 lần khi module load
-# ---------------------------------------------------------------------------
 
+# ============================================================================
+#  BOOTSTRAP VNSTOCK (đăng ký API key)
+# ============================================================================
 def _bootstrap_vnstock() -> None:
     """Đăng ký VNSTOCK_API_KEY từ env nếu có (60 req/phút vs 20 guest)."""
     api_key = os.environ.get("VNSTOCK_API_KEY", "").strip()
@@ -74,10 +78,9 @@ def _bootstrap_vnstock() -> None:
 _bootstrap_vnstock()
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
+# ============================================================================
+#  HELPERS
+# ============================================================================
 def _cache_path() -> Path:
     p = Path(OUTPUT_DIR)
     p.mkdir(parents=True, exist_ok=True)
@@ -90,7 +93,6 @@ def _start_date() -> str:
 
 
 def _today() -> str:
-    """Ngày hôm nay thực tế — dùng để so sánh cache."""
     return date.today().strftime("%Y-%m-%d")
 
 
@@ -100,34 +102,33 @@ def _last_trading_day() -> str:
     T7 → T6, CN → T6, ngày thường → hôm nay.
     """
     today = date.today()
-    dow   = today.weekday()
-    if dow == 5:        # Thứ 7
+    dow = today.weekday()
+    if dow == 5:          # Thứ 7
         today = today - timedelta(days=1)
-    elif dow == 6:      # Chủ nhật
+    elif dow == 6:        # Chủ nhật
         today = today - timedelta(days=2)
     return today.strftime("%Y-%m-%d")
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
+# ============================================================================
+#  LẤY DANH SÁCH MÃ CỔ PHIẾU (có áp dụng RateLimiter)
+# ============================================================================
 def get_hose_tickers() -> list[str]:
     """
     Lấy danh sách tất cả mã cổ phiếu HOSE.
     Strategy:
-      1. symbols_by_exchange() → filter HOSE + STOCK (log columns để debug)
-      2. Fallback: symbols_by_group("HOSE") nếu bước 1 ra 0 kết quả
+      1. symbols_by_exchange() → filter HOSE + STOCK
+      2. Fallback: symbols_by_group("HOSE")
       3. Fallback cuối: all_symbols() (toàn thị trường, không filter sàn)
     """
     from vnstock.explorer.vci.listing import Listing
     listing = Listing()
 
-    # ------------------------------------------------------------------ #
-    # Attempt 1: symbols_by_exchange — filter động theo giá trị thực tế  #
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
+    # Attempt 1: symbols_by_exchange — filter theo giá trị thực tế
+    # ------------------------------------------------------------------
     try:
-        _global_limiter.wait()
+        _global_limiter.wait()  # <--- Áp dụng rate limit
         df = listing.symbols_by_exchange()
         logger.info(
             "symbols_by_exchange columns: %s | sample exchange values: %s",
@@ -136,20 +137,15 @@ def get_hose_tickers() -> list[str]:
         )
 
         if "exchange" in df.columns and "type" in df.columns:
-            # Normalize về upper để khớp cả "HOSE", "HoSE", "HSX"
-            ex_upper   = df["exchange"].astype(str).str.upper()
+            ex_upper = df["exchange"].astype(str).str.upper()
             type_upper = df["type"].astype(str).str.upper()
-
-            # HOSE có thể được gọi là "HOSE" hoặc "HSX" tuỳ source
-            hose_mask  = ex_upper.isin(["HOSE", "HSX"])
-            stock_mask = type_upper == "STOCK"
-            filtered   = df.loc[hose_mask & stock_mask, "symbol"]
-
-        elif "exchange" in df.columns:
-            ex_upper  = df["exchange"].astype(str).str.upper()
             hose_mask = ex_upper.isin(["HOSE", "HSX"])
-            filtered  = df.loc[hose_mask, "symbol"]
-
+            stock_mask = type_upper == "STOCK"
+            filtered = df.loc[hose_mask & stock_mask, "symbol"]
+        elif "exchange" in df.columns:
+            ex_upper = df["exchange"].astype(str).str.upper()
+            hose_mask = ex_upper.isin(["HOSE", "HSX"])
+            filtered = df.loc[hose_mask, "symbol"]
         else:
             # Không có cột exchange → lấy tất cả STOCK
             filtered = df.loc[
@@ -162,19 +158,17 @@ def get_hose_tickers() -> list[str]:
             .sort_values().unique().tolist()
         )
         logger.info("Attempt 1 (symbols_by_exchange): %d tickers", len(tickers))
-
         if len(tickers) > 0:
             return tickers
-
     except Exception as exc:
         logger.warning("Attempt 1 failed: %s", exc)
 
-    # ------------------------------------------------------------------ #
-    # Attempt 2: symbols_by_group("HOSE")                                #
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
+    # Attempt 2: symbols_by_group("HOSE")
+    # ------------------------------------------------------------------
     try:
         _global_limiter.wait()
-        series  = listing.symbols_by_group("HOSE")
+        series = listing.symbols_by_group("HOSE")
         tickers = (
             series.dropna()
             .astype(str).str.upper().str.strip()
@@ -186,12 +180,12 @@ def get_hose_tickers() -> list[str]:
     except Exception as exc:
         logger.warning("Attempt 2 failed: %s", exc)
 
-    # ------------------------------------------------------------------ #
-    # Attempt 3: all_symbols() — toàn thị trường, không filter sàn       #
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------
+    # Attempt 3: all_symbols() — toàn thị trường, không filter sàn
+    # ------------------------------------------------------------------
     try:
         _global_limiter.wait()
-        df      = listing.all_symbols()
+        df = listing.all_symbols()
         tickers = (
             df["symbol"].dropna()
             .astype(str).str.upper().str.strip()
@@ -208,14 +202,17 @@ def get_hose_tickers() -> list[str]:
         "kiểm tra vnstock version và network trong GitHub Actions"
     )
 
+
+# ============================================================================
+#  FETCH OHLCV CHO NHIỀU TICKER (có Rate Limiter & retry thông minh)
+# ============================================================================
 def fetch_ohlcv_all(
     tickers: list[str],
     *,
     start: Optional[str] = None,
     end: Optional[str] = None,
     retry: int = 2,
-    sleep_between: float = 0.8,
-    timeout: int = 10,
+    sleep_between: float = 0.1,   # chỉ để tránh CPU spike, RateLimiter đã điều tiết
 ) -> Dict[str, pd.DataFrame]:
     """
     Fetch OHLCV cho mọi ticker dùng Market.equity.ohlcv() (vnstock v4).
@@ -223,7 +220,7 @@ def fetch_ohlcv_all(
     Tickers lỗi liên tục bị bỏ qua.
     """
     start = start or _start_date()
-    end   = end   or _last_trading_day()
+    end = end or _last_trading_day()
 
     # Guard: không có ngày mới cần fetch
     if start > end:
@@ -237,8 +234,12 @@ def fetch_ohlcv_all(
     results: Dict[str, pd.DataFrame] = {}
 
     for i, ticker in enumerate(tickers, 1):
+        success = False
         for attempt in range(1, retry + 1):
             try:
+                # ---- Áp dụng Rate Limiter TRƯỚC mỗi request ----
+                _global_limiter.wait()
+                # ------------------------------------------------
                 raw = market.equity(ticker).ohlcv(
                     start=start,
                     end=end,
@@ -247,19 +248,42 @@ def fetch_ohlcv_all(
                 df = _normalise_ohlcv(raw, ticker)
                 if df is not None and not df.empty:
                     results[ticker] = df
-                break
-
-            except Exception as exc:
-                if attempt == retry:
-                    logger.warning(
-                        "SKIP %s after %d attempts: %s", ticker, retry, exc
-                    )
+                    success = True
+                    break
                 else:
-                    time.sleep(sleep_between * attempt)
+                    # Nếu df rỗng (không có dữ liệu) thì coi như thành công nhưng không lưu
+                    success = True
+                    break
+            except Exception as exc:
+                # Kiểm tra xem có phải lỗi rate limit không
+                error_msg = str(exc).lower()
+                if "rate limit" in error_msg or "too many requests" in error_msg:
+                    # Chờ lâu hơn, có thể 60s, rồi thử lại
+                    wait_time = 60.0
+                    logger.warning(
+                        "Rate limit hit for %s, sleeping %.1fs before retry",
+                        ticker, wait_time
+                    )
+                    time.sleep(wait_time)
+                    # Tiếp tục vòng lặp (attempt sẽ tăng)
+                    continue
+                else:
+                    # Lỗi khác (mạng, timeout,...)
+                    if attempt == retry:
+                        logger.warning(
+                            "SKIP %s after %d attempts: %s", ticker, retry, exc
+                        )
+                    else:
+                        wait_time = sleep_between * (2 ** attempt)  # exponential backoff
+                        time.sleep(wait_time)
+
+        if not success:
+            logger.warning("Failed to fetch %s after %d attempts", ticker, retry)
 
         if i % 50 == 0:
             logger.info("  fetched %d / %d tickers...", i, len(tickers))
 
+        # Giữ sleep nhẹ để tránh quá tải local (không ảnh hưởng đến rate limit)
         time.sleep(sleep_between)
 
     logger.info("fetch_ohlcv_all done: %d / %d tickers", len(results), len(tickers))
@@ -323,18 +347,19 @@ def _normalise_ohlcv(raw: pd.DataFrame, ticker: str) -> Optional[pd.DataFrame]:
     return df
 
 
-# ---------------------------------------------------------------------------
-# VN-Index overlay
-# ---------------------------------------------------------------------------
-
+# ============================================================================
+#  VN-INDEX OVERLAY
+# ============================================================================
 def fetch_vnindex(start: Optional[str] = None, end: Optional[str] = None) -> Optional[pd.Series]:
     """Fetch VN-Index close series dùng Market.index.ohlcv() (vnstock v4)."""
     start = start or _start_date()
-    end   = end   or _last_trading_day()
+    end = end or _last_trading_day()
     try:
         from vnstock import Market
+        # Áp dụng rate limit cho request này
+        _global_limiter.wait()
         raw = Market().index("VNINDEX").ohlcv(start=start, end=end, interval="1D")
-        df  = _normalise_ohlcv(raw, "VNINDEX")
+        df = _normalise_ohlcv(raw, "VNINDEX")
         if df is not None:
             series = df["close"].rename("VNINDEX")
             # Dedup: giữ ngày cuối nếu trùng
@@ -347,10 +372,9 @@ def fetch_vnindex(start: Optional[str] = None, end: Optional[str] = None) -> Opt
         return None
 
 
-# ---------------------------------------------------------------------------
-# Cache layer — incremental updates
-# ---------------------------------------------------------------------------
-
+# ============================================================================
+#  CACHE LAYER — incremental updates
+# ============================================================================
 def load_cache() -> Dict[str, pd.DataFrame]:
     p = _cache_path()
     if not p.exists():
@@ -398,11 +422,12 @@ def incremental_fetch(
         )
         return cached   # trả nguyên cache, không fetch gì cả
     # ─────────────────────────────────────────────────────────────────────
+
     today = _today()
 
     if cached:
         last_dates = [df.index.max() for df in cached.values() if not df.empty]
-        cache_end  = max(last_dates).strftime("%Y-%m-%d") if last_dates else _start_date()
+        cache_end = max(last_dates).strftime("%Y-%m-%d") if last_dates else _start_date()
     else:
         cache_end = _start_date()
 
@@ -416,9 +441,8 @@ def incremental_fetch(
         tickers,
         start=new_start,
         end=today,
-        sleep_between=0.5,   # incremental: chỉ 1-2 ngày/ticker → nhanh hơn
-        retry=1,        # cuối tuần/ngày lỗi → skip ngay, không retry
-        timeout=8,      # imeout ngắn hơn
+        sleep_between=0.1,      # nhỏ hơn vì chỉ lấy vài ngày
+        retry=1,                # ít retry để nhanh
     )
 
     merged: Dict[str, pd.DataFrame] = {}
@@ -429,3 +453,19 @@ def incremental_fetch(
             merged[t] = combined[~combined.index.duplicated(keep="last")]
 
     return merged
+
+
+# ============================================================================
+#  (Optional) Main entry point for testing
+# ============================================================================
+if __name__ == "__main__":
+    # Simple test: fetch tickers and a few OHLCV
+    logging.basicConfig(level=logging.INFO)
+    tickers = get_hose_tickers()
+    print(f"Found {len(tickers)} tickers. First 5: {tickers[:5]}")
+
+    # Test fetch small subset
+    sample = tickers[:5]
+    data = fetch_ohlcv_all(sample, start="2025-01-01", end="2025-01-10")
+    for t, df in data.items():
+        print(f"{t}: {len(df)} rows")
