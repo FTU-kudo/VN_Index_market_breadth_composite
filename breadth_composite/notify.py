@@ -46,7 +46,7 @@ Yêu cầu Output (Viết bằng tiếng Việt, ngắn gọn, súc tích, tổn
 
 🔍 **NHẬN ĐỊNH CHUNG**: (1-2 câu gọi tên chính xác trạng thái cốt lõi của thị trường và xu hướng chủ đạo).
 
-📊 **CHI TIẾT 5 CHỈ BÁO** (Mỗi chỉ báo gói gọn trong 1 dòng, chỉ rõ trạng thái Tích cực/Tiêu cực/Trung lập + lý do kỹ thuật ngắn):
+📊 **CHI TIẾT 5 CHỈ BÁO** (Mỗi chỉ báo gói gọn trong 1 dòng,yêu cầu phải có số liệu chính xác, chỉ rõ trạng thái Tích cực/Tiêu cực/Trung lập + lý do kỹ thuật ngắn):
 1. **% Stocks Above MA20/50/200:** [Trạng thái] → [Xu hướng ngắn/trung/dài hạn]
 2. **Advance-Decline Line (ADL):** [Trạng thái] → [Sức mạnh dòng tiền tổng thể]
 3. **McClellan Oscillator & Summation Index:** [Trạng thái] → [Động lượng ngắn hạn và trung hạn]
