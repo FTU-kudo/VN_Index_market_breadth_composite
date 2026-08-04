@@ -4,8 +4,8 @@ on:
   repository_dispatch:
     types: [run-breadth]
 
-  schedule:
-    - cron: "30 10 * * 1-5"   # 17:30 ICT (UTC+7), Mon–Fri
+  # schedule:
+  #   - cron: "30 10 * * 1-5"   # 17:30 ICT (UTC+7), Mon–Fri
 
   workflow_dispatch:
     inputs:
