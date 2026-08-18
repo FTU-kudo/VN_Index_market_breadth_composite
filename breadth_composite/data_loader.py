@@ -120,7 +120,7 @@ def get_hose_tickers() -> list[str]:
       2. Fallback: symbols_by_group("HOSE")
       3. Fallback cuối: all_symbols()
     """
-    from vnstock.explorer.vci.listing import Listing
+    from vnstock import Listing
     listing = Listing()
 
     # ------------------------------------------------------------------
