@@ -10,8 +10,9 @@ XlsxWriter>=3.1.0
 # Chart rendering
 matplotlib>=3.7.0
 
-# HTTP (Gemini + Telegram API)
+# HTTP & APIs (Telegram + Gemini)
 requests>=2.31.0
+google-genai>=0.2.0
 
 # Step 2 (future): regime detection
 # hmmlearn>=0.3.0

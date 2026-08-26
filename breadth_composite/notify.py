@@ -33,16 +33,7 @@ import requests
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Gemini Text Analysis (không dùng Vision/image)
-# ---------------------------------------------------------------------------
-
 GEMINI_MODEL   = "gemini-2.5-flash-lite"
-GEMINI_API_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/models/"
-    f"{GEMINI_MODEL}:generateContent"
-)
-
 _ANALYSIS_PROMPT = """
 Bạn là một chuyên gia phân tích thị trường chứng khoán Việt Nam (HOSE) với 10 năm kinh nghiệm, nổi tiếng với lối phân tích thực chiến, sắc bén và cô đọng.
 
@@ -167,34 +158,30 @@ def analyse_with_gemini(
         metrics_text=metrics_text,
     )
 
-    # Text-only payload — không gửi ảnh, tránh 404 do payload quá lớn
-    payload = {
-        "contents": [{
-            "parts": [
-                {"text": prompt_text},
-            ]
-        }],
-        "generationConfig": {
-            "temperature":     0.3,
-            "maxOutputTokens": 1200,
-        },
-    }
-
     try:
-        resp = requests.post(
-            GEMINI_API_URL,
-            params={"key": api_key},
-            json=payload,
-            timeout=60,
+        from google import genai
+        from google.genai import types
+        
+        client = genai.Client(api_key=api_key)
+        
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt_text,
+            config=types.GenerateContentConfig(
+                temperature=0.3,
+                max_output_tokens=1200,
+            )
         )
-        resp.raise_for_status()
-        data     = resp.json()
-        analysis = data["candidates"][0]["content"]["parts"][0]["text"]
+        
+        analysis = response.text
         logger.info("Gemini analysis received (%d chars)", len(analysis))
         return analysis.strip()
 
+    except ImportError:
+        logger.error("Missing google-genai library. Please pip install google-genai>=0.2.0")
+        return f"❌ Gemini lỗi: Thiếu thư viện google-genai\n\n📊 Dữ liệu thô:\n{metrics_text}"
     except Exception as exc:
-        logger.error("Gemini API error: %s", exc)
+        logger.error("Gemini SDK error: %s", exc)
         return f"❌ Gemini lỗi: {exc}\n\n📊 Dữ liệu thô:\n{metrics_text}"
 
 
