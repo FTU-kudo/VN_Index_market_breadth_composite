@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 # Gemini Vision — phân tích chart
 # ---------------------------------------------------------------------------
 
-GEMINI_MODEL   = "gemini-2.0-flash"
+GEMINI_MODEL   = "gemini-2.5-flash-lite"
 GEMINI_API_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
     f"{GEMINI_MODEL}:generateContent"
@@ -160,8 +160,8 @@ def analyse_with_gemini(
         logger.error("GEMINI_API_KEY not set — kiểm tra GitHub Secrets hoặc file .env")
         return "❌ Không thể phân tích: thiếu GEMINI_API_KEY."
 
-    # Encode ảnh
-    png_bytes = Path(chart_png_path).read_bytes()
+    # Nén ảnh trước khi encode — ảnh gốc có thể > 10MB, quá lớn cho REST API
+    png_bytes = _compress_image_for_api(chart_png_path)
     b64_image = base64.b64encode(png_bytes).decode("utf-8")
 
     today_str    = date.today().strftime("%d/%m/%Y")
@@ -205,6 +205,52 @@ def analyse_with_gemini(
     except Exception as exc:
         logger.error("Gemini API error: %s", exc)
         return f"❌ Gemini lỗi: {exc}\n\n📊 Dữ liệu thô:\n{metrics_text}"
+
+
+def _compress_image_for_api(chart_png_path: str) -> bytes:
+    """
+    Nén ảnh chart về kích thước nhỏ hơn trước khi gửi qua Gemini REST API.
+
+    Vấn đề: Ảnh gốc 18×16 inch @ 150dpi = 2700×2400px → base64 ≈ 10–15 MB
+    → Vượt giới hạn payload của Gemini REST API → lỗi 404.
+
+    Giải pháp: Re-render về 12×9 inch @ 96dpi ≈ 1152×864px → ≈ 0.5–1 MB.
+    Dùng matplotlib (dependency có sẵn) — không cần thêm thư viện mới.
+    """
+    import io
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.image as mpimg
+
+    original_size_mb = Path(chart_png_path).stat().st_size / 1_000_000
+
+    try:
+        img_arr = mpimg.imread(chart_png_path)
+        # Re-render ở resolution thấp hơn: 12×9 inch @ 96dpi = 1152×864px
+        fig, ax = plt.subplots(figsize=(12, 9), dpi=96)
+        ax.imshow(img_arr, aspect="auto")
+        ax.axis("off")
+        plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=96, bbox_inches="tight", pad_inches=0)
+        plt.close(fig)
+        buf.seek(0)
+        compressed = buf.read()
+        compressed_mb = len(compressed) / 1_000_000
+        logger.info(
+            "Image compressed for API: %.1f MB → %.1f MB (%.0f%% reduction)",
+            original_size_mb,
+            compressed_mb,
+            (1 - compressed_mb / original_size_mb) * 100 if original_size_mb > 0 else 0,
+        )
+        return compressed
+    except Exception as exc:
+        logger.warning(
+            "Image compression failed (%s) — sending original %.1f MB (may cause 404)",
+            exc, original_size_mb,
+        )
+        return Path(chart_png_path).read_bytes()
 
 
 # ---------------------------------------------------------------------------
