@@ -70,16 +70,16 @@ Thay vì chỉ nhìn vào giá VN-Index, hệ thống này đo lường **"sức
 ### 📊 Dashboard 3×2 Panel (PNG)
 
 ```
-┌─────────────────────┬─────────────────────┐
-│ % Stocks Above MA   │ ADL + High-Low Line  │
-│ + VN-Index overlay  │ + McClellan Osc      │
-├─────────────────────┼─────────────────────┤
-│ McClellan Osc/Sum   │ Net A/D Ratio %      │
-│ (bar + dual axis)   │ + Breadth Thrust     │
-├─────────────────────┼─────────────────────┤
-│ Volume Breadth      │ Composite Score      │
-│ UpVol% + TRIN       │ + Regime Shading     │
-└─────────────────────┴─────────────────────┘
+┌──────────────────────────┬──────────────────────────┐
+│  % Stocks Above MA       │  ADL + High-Low Line      │
+│  + VN-Index overlay      │  + McClellan Osc          │
+├──────────────────────────┼──────────────────────────┤
+│  McClellan Osc/Sum       │  Net A/D Ratio %          │
+│  (bar + dual axis)       │  + Breadth Thrust         │
+├──────────────────────────┼──────────────────────────┤
+│  Volume Breadth          │  Composite Score          │
+│  UpVol% + TRIN           │  + Regime Shading         │
+└──────────────────────────┴──────────────────────────┘
 ```
 
 ### 🤖 AI-Powered Analysis
@@ -325,5 +325,5 @@ MIT License — Xem file [LICENSE](LICENSE) để biết thêm chi tiết.
 ---
 
 <div align="center">
-<sub>Built with ❤️ for Vietnamese investors | Dữ liệu từ HOSE via vnstock v4</sub>
+<sub>©️ FTU-Kudo</sub>
 </div>
