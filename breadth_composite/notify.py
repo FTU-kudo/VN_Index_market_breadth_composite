@@ -1,5 +1,5 @@
 """
-notify.py — Gemini Vision phân tích chart + gửi Telegram
+notify.py — Gemini Vision phân tích chart + gửi Telegram (v2.0)
 
 Flow:
   1. Đọc file PNG từ chart_render.py
@@ -7,7 +7,7 @@ Flow:
   3. Nhận phân tích markdown → format thành Telegram message
   4. Gửi qua Bot API
 
-Secrets cần trong GitHub Actions:
+Secrets cần trong GitHub Actions (đọc từ os.environ — KHÔNG hardcode):
   GEMINI_API_KEY
   TELEGRAM_TOKEN
   TELEGRAM_ID
@@ -18,6 +18,7 @@ from __future__ import annotations
 import base64
 import logging
 import os
+import re
 from datetime import date
 from pathlib import Path
 from typing import Optional
@@ -32,7 +33,7 @@ logger = logging.getLogger(__name__)
 # Gemini Vision — phân tích chart
 # ---------------------------------------------------------------------------
 
-GEMINI_MODEL   = "gemini-3.1-flash-lite"
+GEMINI_MODEL   = "gemini-2.5-flash-lite"
 GEMINI_API_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
     f"{GEMINI_MODEL}:generateContent"
@@ -40,30 +41,43 @@ GEMINI_API_URL = (
 
 _ANALYSIS_PROMPT = """
 Bạn là một chuyên gia phân tích kỹ thuật kỳ cựu tại thị trường chứng khoán Việt Nam (HOSE) với 10 năm kinh nghiệm, nổi tiếng với lối phân tích thực chiến, sắc bén và cô đọng.
-Nhiệm vụ của bạn là kết hợp dữ liệu từ hình ảnh "Market Breadth Dashboard" và thông tin số liệu `{metrics_text}` của ngày hôm nay ({today}) để đưa ra một báo cáo phân tích độ rộng thị trường chuyên sâu.
-Hãy liên kết các chỉ báo với nhau (ví dụ: so sánh giữa Momentum, Dòng tiền và Số lượng mã giữ xu hướng) để tìm ra bản chất thực sự của thị trường (Tích lũy, Phân phối, Bùng nổ hay Bẫy tăng giá).
-Yêu cầu Output (Viết bằng tiếng Việt, ngắn gọn, súc tích, tổng dưới 280 từ):
 
-🔍 **NHẬN ĐỊNH CHUNG**: (1-2 câu gọi tên chính xác trạng thái cốt lõi của thị trường và xu hướng chủ đạo).
+Nhiệm vụ: Kết hợp hình ảnh "Market Breadth Dashboard 3×2" và dữ liệu số liệu `{metrics_text}` của ngày {today} để đưa ra báo cáo phân tích breadth thị trường chuyên sâu.
 
-📊 **CHI TIẾT 5 CHỈ BÁO** (Mỗi chỉ báo gói gọn trong 1 dòng, yêu cầu phải có số liệu chính xác, chỉ rõ trạng thái Tích cực/Tiêu cực/Trung lập + lý do kỹ thuật ngắn):
-1. **% Stocks Above MA20/50/200:** [Trạng thái] → [Xu hướng ngắn/trung/dài hạn]
-2. **Advance-Decline Line (ADL):** [Trạng thái] → [Sức mạnh dòng tiền tổng thể]
-3. **McClellan Oscillator & Summation Index:** [Trạng thái] → [Động lượng ngắn hạn và trung hạn]
-4. **Net New 52W Highs/Lows:** [Trạng thái] → [Chất lượng và độ bền của xu hướng]
-5. **Net A/D Ratio:** [Trạng thái] → [Số mã giảm / tăng và nhận định chất lượng thị trường]
+Lưu ý về dashboard mới (6 panels):
+- Panel [1,1]: % Stocks Above MA5/20/50/200 + VN-Index
+- Panel [1,2]: ADL + High-Low Line (xác nhận xu hướng dài hạn)
+- Panel [2,1]: McClellan Oscillator + Summation Index
+- Panel [2,2]: Net A/D Ratio + Breadth Thrust overlay
+- Panel [3,1]: Volume Breadth — UpVol Ratio % + TRIN Arms Index
+- Panel [3,2]: Composite Score (0–100) + Market Regime shading
+
+Yêu cầu Output (Viết bằng tiếng Việt, ngắn gọn, súc tích, tổng dưới 350 từ):
+
+🎯 **REGIME & COMPOSITE**: (Composite Score = bao nhiêu → trạng thái Bullish/Neutral/Bearish. Regime hiện tại là gì?)
+
+🔍 **NHẬN ĐỊNH CHUNG**: (1-2 câu gọi tên chính xác trạng thái cốt lõi của thị trường)
+
+📊 **CHI TIẾT 7 CHỈ BÁO** (mỗi chỉ báo 1 dòng, có số liệu chính xác):
+1. **% Above MA50/200:** [số liệu] → [xu hướng trung/dài hạn]
+2. **ADL + High-Low Line:** [số liệu] → [sức mạnh dòng tiền và chất lượng xu hướng]
+3. **McClellan Osc/Sum:** [số liệu] → [momentum ngắn hạn và trung hạn]
+4. **Net New 52W H/L:** [số liệu] → [chất lượng đỉnh mới]
+5. **Net A/D Ratio:** [số liệu] → [số mã tăng/giảm]
+6. **UpVol Ratio + TRIN:** [số liệu] → [chất lượng dòng tiền theo volume] (ghi "N/A" nếu không có volume data)
+7. **Breadth Thrust:** [số liệu] → [đo đà bùng phát/suy yếu ngắn hạn]
 
 ⏱ **NGẮN HẠN (1-4 tuần)**
 [1 câu nhận định momentum và rủi ro gần]
 
 📅 **DÀI HẠN (3-6 tháng)**
-[1 câu nhận định xu hướng lớn từ ADL và MA200]
+[1 câu nhận định xu hướng lớn từ ADL, High-Low Line và MA200]
 
-⚠️ **RỦI RO CẦN CHÚ Ý**: (Chỉ ra tín hiệu phân kỳ - Divergence, vùng quá mua/quá bán, hoặc sự suy yếu ngầm nếu có. Nếu không có, ghi "Chưa ghi nhận rủi ro lớn").
+⚠️ **RỦI RO / PHÂN KỲ**: (Tín hiệu divergence, quá mua/quá bán, TRIN bất thường. Nếu không → "Chưa ghi nhận rủi ro lớn")
 
-🎯 **HÀNH ĐỘNG CHIẾN LƯỢC**: (Gói gọn 1 câu: Đưa ra khuyến nghị vị thế [Thận trọng / Trung lập / Tích cực] kèm hành động ưu tiên cho danh mục).
+🎬 **HÀNH ĐỘNG CHIẾN LƯỢC**: (1 câu: vị thế [Thận trọng/Trung lập/Tích cực] + ưu tiên hành động cho danh mục)
 
-Lưu ý: Sử dụng emoji phù hợp để tăng tính scannable. Tuyệt đối không viết lan man, tập trung vào tính thực chiến cho nhà đầu tư.
+Dùng emoji tăng tính scannable. Tập trung vào tính thực chiến cho nhà đầu tư.
 """
 
 
@@ -80,18 +94,50 @@ def _build_metrics_text(breadth: pd.DataFrame) -> str:
             return "N/A"
         return f"{v:{fmt}}"
 
+    # Xác định trạng thái regime
+    regime_val = last.get("regime")
+    if regime_val is None or pd.isna(regime_val):
+        regime_label = "N/A"
+    elif int(regime_val) == 1:
+        regime_label = "🟢 BULL"
+    elif int(regime_val) == -1:
+        regime_label = "🔴 BEAR"
+    else:
+        regime_label = "🟡 TRANSITION"
+
     lines = [
-        f"- % > MA20  : {_fmt('pct_above_ma20')}%",
-        f"- % > MA50  : {_fmt('pct_above_ma50')}%",
-        f"- % > MA200 : {_fmt('pct_above_ma200')}%",
-        f"- ADL       : {_fmt('adl', ',.0f')}",
-        f"- McClellan Osc : {_fmt('mcclellan_osc')}",
-        f"- McClellan Sum : {_fmt('mcclellan_sum', ',.0f')}",
-        f"- New Highs : {_fmt('new_highs', '.0f')}",
-        f"- New Lows  : {_fmt('new_lows', '.0f')}",
-        f"- Net A/D Ratio: {_fmt('net_new_highs_pct')}%",
-        f"- Advances  : {_fmt('advances', '.0f')}",
-        f"- Declines  : {_fmt('declines', '.0f')}",
+        "=== CHỈ BÁO CỐT LÕI ===",
+        f"- % > MA5    : {_fmt('pct_above_ma5')}%",
+        f"- % > MA20   : {_fmt('pct_above_ma20')}%",
+        f"- % > MA50   : {_fmt('pct_above_ma50')}%",
+        f"- % > MA200  : {_fmt('pct_above_ma200')}%",
+        "",
+        "=== ADVANCE-DECLINE ===",
+        f"- ADL              : {_fmt('adl', ',.0f')}",
+        f"- ADL Slope (20D)  : {_fmt('adl_slope')}",
+        f"- Advances         : {_fmt('advances', '.0f')}",
+        f"- Declines         : {_fmt('declines', '.0f')}",
+        "",
+        "=== MCCLELLAN ===",
+        f"- McClellan Osc    : {_fmt('mcclellan_osc')}",
+        f"- McClellan Sum    : {_fmt('mcclellan_sum', ',.0f')}",
+        "",
+        "=== NEW HIGHS/LOWS ===",
+        f"- New Highs        : {_fmt('new_highs', '.0f')}",
+        f"- New Lows         : {_fmt('new_lows', '.0f')}",
+        f"- Net H/L %        : {_fmt('net_new_highs_pct')}%",
+        "",
+        "=== CHỈ BÁO MỚI ===",
+        f"- Breadth Thrust   : {_fmt('breadth_thrust')}%  (>61.5% = bullish thrust)",
+        f"- % Rising 3D      : {_fmt('pct_rising_3d')}%",
+        f"- UpVol Ratio      : {_fmt('upvol_ratio')}%  (>50% = bullish volume flow)",
+        f"- TRIN             : {_fmt('trin')}  (<1.0 = bullish)",
+        f"- High-Low Line    : {_fmt('high_low_line', ',.0f')}",
+        f"- AdvVol Line      : {_fmt('adv_vol_line', ',.0f')}",
+        "",
+        "=== REGIME & COMPOSITE ===",
+        f"- Composite Score  : {_fmt('composite_score')}/100",
+        f"- Market Regime    : {regime_label}",
     ]
     return "\n".join(lines)
 
@@ -102,14 +148,16 @@ def analyse_with_gemini(
 ) -> str:
     """
     Gửi PNG + data text đến Gemini Vision, nhận về phân tích tiếng Việt.
+    API key đọc hoàn toàn từ os.environ — không bao giờ hardcode.
 
     Returns
     -------
     str  — nội dung phân tích, hoặc fallback text nếu lỗi
     """
+    # Đọc API key từ environment — bảo mật tuyệt đối
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
-        logger.error("GEMINI_API_KEY not set")
+        logger.error("GEMINI_API_KEY not set — kiểm tra GitHub Secrets hoặc file .env")
         return "❌ Không thể phân tích: thiếu GEMINI_API_KEY."
 
     # Encode ảnh
@@ -136,8 +184,8 @@ def analyse_with_gemini(
             ]
         }],
         "generationConfig": {
-            "temperature":     0.3,   # ổn định, ít sáng tạo tuỳ tiện
-            "maxOutputTokens": 800,
+            "temperature":     0.3,
+            "maxOutputTokens": 1000,
         },
     }
 
@@ -149,10 +197,8 @@ def analyse_with_gemini(
             timeout=60,
         )
         resp.raise_for_status()
-        data = resp.json()
-        analysis = (
-            data["candidates"][0]["content"]["parts"][0]["text"]
-        )
+        data     = resp.json()
+        analysis = data["candidates"][0]["content"]["parts"][0]["text"]
         logger.info("Gemini analysis received (%d chars)", len(analysis))
         return analysis.strip()
 
@@ -169,12 +215,19 @@ def send_telegram(
     text: str,
     image_path: Optional[str] = None,
 ) -> bool:
-    """Gửi ảnh + text phân tích qua Telegram (MarkdownV2, bold support)."""
+    """
+    Gửi ảnh + text phân tích qua Telegram.
+    Token và chat_id đọc hoàn toàn từ os.environ — không bao giờ hardcode.
+    """
+    # Đọc credentials từ environment — bảo mật tuyệt đối
     token   = os.environ.get("TELEGRAM_TOKEN", "").strip()
     chat_id = os.environ.get("TELEGRAM_ID", "").strip()
 
     if not token or not chat_id:
-        logger.error("TELEGRAM_TOKEN or TELEGRAM_ID not set")
+        logger.error(
+            "TELEGRAM_TOKEN hoặc TELEGRAM_ID không được set — "
+            "kiểm tra GitHub Secrets hoặc file .env"
+        )
         return False
 
     base_url = f"https://api.telegram.org/bot{token}"
@@ -196,37 +249,28 @@ def send_telegram(
             logger.warning("Telegram sendPhoto failed: %s", exc)
             success = False
 
-    # Message 2: text phân tích – use the safe sender
+    # Message 2: text phân tích
     if not _send_text_message(base_url, chat_id, text):
         success = False
 
     return success
 
-# Send bold text for importance headlines
-import re
 
 def _text_to_html(text: str) -> str:
-    """
-    Convert '**bold**' to '<b>bold</b>' and escape HTML special chars elsewhere.
-    """
-    # 1. Escape '<', '>', '&' in the whole text first
-    text = text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-
-    # 2. Replace '**...**' with '<b>...</b>' (greedy? we use DOTALL + non-greedy)
-    text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text, flags=re.DOTALL)
-
+    """Convert '**bold**' sang '<b>bold</b>' và escape HTML special chars."""
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text, flags=re.DOTALL)
     return text
 
 
 def _send_text_message(base_url: str, chat_id: str, text: str) -> bool:
     """
-    Send message with HTML parse mode. Fall back to plain text on failure,
-    and in the fallback strip the ** markers to avoid confusion.
+    Gửi message với HTML parse mode.
+    Fallback về plain text nếu HTML parsing lỗi.
     """
     MAX_LEN = 4000
     success = True
 
-    # Prepare HTML version
     html_text = _text_to_html(text)
     chunks = [html_text[i: i + MAX_LEN] for i in range(0, len(html_text), MAX_LEN)]
 
@@ -244,9 +288,8 @@ def _send_text_message(base_url: str, chat_id: str, text: str) -> bool:
             resp.raise_for_status()
             logger.info("HTML sent (%d chars)", len(chunk))
         except Exception as exc:
-            # Log the error
             response_text = ""
-            if hasattr(exc, 'response') and exc.response is not None:
+            if hasattr(exc, "response") and exc.response is not None:
                 try:
                     response_text = exc.response.text
                 except Exception:
@@ -255,10 +298,11 @@ def _send_text_message(base_url: str, chat_id: str, text: str) -> bool:
                 "HTML parse failed: %s\nResponse body: %s", exc, response_text
             )
 
-            # Fallback: plain text, but remove ** markers so it's clean
+            # Fallback: plain text
             logger.info("Falling back to plain text…")
-            plain_text = text.replace('**', '')   # strip all asterisks
-            plain_chunks = [plain_text[i: i + 4000] for i in range(0, len(plain_text), 4000)]
+            plain_text   = text.replace("**", "")
+            plain_chunks = [plain_text[i: i + 4000]
+                            for i in range(0, len(plain_text), 4000)]
             for plain in plain_chunks:
                 try:
                     resp = requests.post(
@@ -271,10 +315,11 @@ def _send_text_message(base_url: str, chat_id: str, text: str) -> bool:
                 except Exception as fallback_exc:
                     logger.error("Plain text fallback also failed: %s", fallback_exc)
                     success = False
-            break   # Stop after first failed chunk
+            break
 
     return success
-  
+
+
 # ---------------------------------------------------------------------------
 # Master notify function — gọi từ main.py
 # ---------------------------------------------------------------------------
@@ -285,13 +330,13 @@ def notify_daily(
 ) -> None:
     """
     Hàm duy nhất được gọi từ main.py:
-      1. Gemini phân tích chart + data
+      1. Gemini phân tích chart + data (6 panels mới)
       2. Gửi Telegram: ảnh + phân tích
 
     Lỗi được log nhưng không raise để không crash pipeline chính.
     """
     today_str = date.today().strftime("%d/%m/%Y")
-    logger.info("=== Gemini analysis ===")
+    logger.info("=== Gemini analysis (v2.0 — 6-panel dashboard) ===")
 
     try:
         analysis = analyse_with_gemini(chart_png_path, breadth)
@@ -299,10 +344,23 @@ def notify_daily(
         logger.error("analyse_with_gemini crashed: %s", exc)
         analysis = f"❌ Lỗi phân tích Gemini: {exc}"
 
+    # Lấy composite score và regime cho header
+    composite_str = ""
+    regime_str    = ""
+    if not breadth.empty:
+        last = breadth.dropna(how="all").iloc[-1]
+        cs   = last.get("composite_score")
+        rg   = last.get("regime")
+        if cs is not None and not pd.isna(cs):
+            composite_str = f" | Score: {cs:.0f}/100"
+        if rg is not None and not pd.isna(rg):
+            regime_icons = {1: "🟢 Bull", 0: "🟡 Transition", -1: "🔴 Bear"}
+            regime_str = f" | {regime_icons.get(int(rg), '')}"
+
     header = (
-        f"📈 **VN-Index Breadth Report**\n"
-        f"📅 {today_str}\n"
-        f"{'─' * 32}\n\n"
+        f"📈 **VN-Index Breadth Report v2.0**\n"
+        f"📅 {today_str}{composite_str}{regime_str}\n"
+        f"{'─' * 34}\n\n"
     )
     full_message = header + analysis
 
