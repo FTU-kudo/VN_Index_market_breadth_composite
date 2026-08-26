@@ -1,11 +1,15 @@
 """
-notify.py — Gemini Vision phân tích chart + gửi Telegram (v2.0)
+notify.py — Gemini Text Analysis + Telegram Notification (v2.1)
 
 Flow:
-  1. Đọc file PNG từ chart_render.py
-  2. Encode base64 → gửi Gemini Vision kèm data text hôm nay
-  3. Nhận phân tích markdown → format thành Telegram message
-  4. Gửi qua Bot API
+  1. Tổng hợp dữ liệu breadth thành text metrics
+  2. Gửi TEXT-ONLY cho Gemini → nhận phân tích tiếng Việt
+  3. Gửi Telegram: ảnh PNG (để xem) + text phân tích của Gemini
+
+Lý do dùng text-only (không gửi ảnh lên Gemini):
+  - Ảnh PNG 3×2 @ 150dpi có thể > 10MB → 404 từ Gemini REST API
+  - Gemini đọc số liệu text cũng cho kết quả phân tích tốt
+  - Ảnh PNG vẫn được gửi qua Telegram để người dùng xem trực quan
 
 Secrets cần trong GitHub Actions (đọc từ os.environ — KHÔNG hardcode):
   GEMINI_API_KEY
@@ -15,7 +19,6 @@ Secrets cần trong GitHub Actions (đọc từ os.environ — KHÔNG hardcode):
 
 from __future__ import annotations
 
-import base64
 import logging
 import os
 import re
@@ -23,6 +26,7 @@ from datetime import date
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 import requests
 
@@ -30,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Gemini Vision — phân tích chart
+# Gemini Text Analysis (không dùng Vision/image)
 # ---------------------------------------------------------------------------
 
 GEMINI_MODEL   = "gemini-2.5-flash-lite"
@@ -40,17 +44,13 @@ GEMINI_API_URL = (
 )
 
 _ANALYSIS_PROMPT = """
-Bạn là một chuyên gia phân tích kỹ thuật kỳ cựu tại thị trường chứng khoán Việt Nam (HOSE) với 10 năm kinh nghiệm, nổi tiếng với lối phân tích thực chiến, sắc bén và cô đọng.
+Bạn là một chuyên gia phân tích thị trường chứng khoán Việt Nam (HOSE) với 10 năm kinh nghiệm, nổi tiếng với lối phân tích thực chiến, sắc bén và cô đọng.
 
-Nhiệm vụ: Kết hợp hình ảnh "Market Breadth Dashboard 3×2" và dữ liệu số liệu `{metrics_text}` của ngày {today} để đưa ra báo cáo phân tích breadth thị trường chuyên sâu.
+Nhiệm vụ: Dựa vào dữ liệu Market Breadth dưới đây của ngày {today}, hãy đưa ra báo cáo phân tích chuyên sâu.
 
-Lưu ý về dashboard mới (6 panels):
-- Panel [1,1]: % Stocks Above MA5/20/50/200 + VN-Index
-- Panel [1,2]: ADL + High-Low Line (xác nhận xu hướng dài hạn)
-- Panel [2,1]: McClellan Oscillator + Summation Index
-- Panel [2,2]: Net A/D Ratio + Breadth Thrust overlay
-- Panel [3,1]: Volume Breadth — UpVol Ratio % + TRIN Arms Index
-- Panel [3,2]: Composite Score (0–100) + Market Regime shading
+--- DỮ LIỆU BREADTH HÔM NAY ---
+{metrics_text}
+--- HẾT DỮ LIỆU ---
 
 Yêu cầu Output (Viết bằng tiếng Việt, ngắn gọn, súc tích, tổng dưới 350 từ):
 
@@ -60,20 +60,20 @@ Yêu cầu Output (Viết bằng tiếng Việt, ngắn gọn, súc tích, tổn
 
 📊 **CHI TIẾT 7 CHỈ BÁO** (mỗi chỉ báo 1 dòng, có số liệu chính xác):
 1. **% Above MA50/200:** [số liệu] → [xu hướng trung/dài hạn]
-2. **ADL + High-Low Line:** [số liệu] → [sức mạnh dòng tiền và chất lượng xu hướng]
-3. **McClellan Osc/Sum:** [số liệu] → [momentum ngắn hạn và trung hạn]
+2. **ADL + ADL Slope:** [số liệu] → [sức mạnh dòng tiền breadth]
+3. **McClellan Osc/Sum:** [số liệu] → [momentum ngắn/trung hạn]
 4. **Net New 52W H/L:** [số liệu] → [chất lượng đỉnh mới]
-5. **Net A/D Ratio:** [số liệu] → [số mã tăng/giảm]
-6. **UpVol Ratio + TRIN:** [số liệu] → [chất lượng dòng tiền theo volume] (ghi "N/A" nếu không có volume data)
+5. **Net A/D Ratio:** [số liệu] → [số mã tăng/giảm hôm nay]
+6. **UpVol Ratio + TRIN:** [số liệu] → [chất lượng dòng tiền theo volume] (ghi "N/A" nếu không có)
 7. **Breadth Thrust:** [số liệu] → [đo đà bùng phát/suy yếu ngắn hạn]
 
 ⏱ **NGẮN HẠN (1-4 tuần)**
 [1 câu nhận định momentum và rủi ro gần]
 
 📅 **DÀI HẠN (3-6 tháng)**
-[1 câu nhận định xu hướng lớn từ ADL, High-Low Line và MA200]
+[1 câu nhận định xu hướng lớn từ ADL, MA200]
 
-⚠️ **RỦI RO / PHÂN KỲ**: (Tín hiệu divergence, quá mua/quá bán, TRIN bất thường. Nếu không → "Chưa ghi nhận rủi ro lớn")
+⚠️ **RỦI RO / PHÂN KỲ**: (Tín hiệu divergence, quá mua/quá bán, bất thường. Nếu không → "Chưa ghi nhận rủi ro lớn")
 
 🎬 **HÀNH ĐỘNG CHIẾN LƯỢC**: (1 câu: vị thế [Thận trọng/Trung lập/Tích cực] + ưu tiên hành động cho danh mục)
 
@@ -82,7 +82,7 @@ Dùng emoji tăng tính scannable. Tập trung vào tính thực chiến cho nh�
 
 
 def _build_metrics_text(breadth: pd.DataFrame) -> str:
-    """Trích xuất dòng dữ liệu cuối cùng thành text cho prompt."""
+    """Trích xuất dòng dữ liệu cuối cùng thành text để Gemini đọc."""
     if breadth.empty:
         return "Không có dữ liệu."
 
@@ -90,13 +90,13 @@ def _build_metrics_text(breadth: pd.DataFrame) -> str:
 
     def _fmt(col: str, fmt: str = ".1f") -> str:
         v = last.get(col)
-        if v is None or pd.isna(v):
+        if v is None or (isinstance(v, float) and np.isnan(v)):
             return "N/A"
         return f"{v:{fmt}}"
 
     # Xác định trạng thái regime
     regime_val = last.get("regime")
-    if regime_val is None or pd.isna(regime_val):
+    if regime_val is None or (isinstance(regime_val, float) and np.isnan(regime_val)):
         regime_label = "N/A"
     elif int(regime_val) == 1:
         regime_label = "🟢 BULL"
@@ -117,6 +117,7 @@ def _build_metrics_text(breadth: pd.DataFrame) -> str:
         f"- ADL Slope (20D)  : {_fmt('adl_slope')}",
         f"- Advances         : {_fmt('advances', '.0f')}",
         f"- Declines         : {_fmt('declines', '.0f')}",
+        f"- Unchanged        : {_fmt('unchanged', '.0f')}",
         "",
         "=== MCCLELLAN ===",
         f"- McClellan Osc    : {_fmt('mcclellan_osc')}",
@@ -128,10 +129,10 @@ def _build_metrics_text(breadth: pd.DataFrame) -> str:
         f"- Net H/L %        : {_fmt('net_new_highs_pct')}%",
         "",
         "=== CHỈ BÁO MỚI ===",
-        f"- Breadth Thrust   : {_fmt('breadth_thrust')}%  (>61.5% = bullish thrust)",
+        f"- Breadth Thrust   : {_fmt('breadth_thrust')}%  (>61.5% = bullish thrust signal)",
         f"- % Rising 3D      : {_fmt('pct_rising_3d')}%",
         f"- UpVol Ratio      : {_fmt('upvol_ratio')}%  (>50% = bullish volume flow)",
-        f"- TRIN             : {_fmt('trin')}  (<1.0 = bullish)",
+        f"- TRIN             : {_fmt('trin')}  (<1.0 = bullish volume pressure)",
         f"- High-Low Line    : {_fmt('high_low_line', ',.0f')}",
         f"- AdvVol Line      : {_fmt('adv_vol_line', ',.0f')}",
         "",
@@ -143,26 +144,21 @@ def _build_metrics_text(breadth: pd.DataFrame) -> str:
 
 
 def analyse_with_gemini(
-    chart_png_path: str,
     breadth: pd.DataFrame,
 ) -> str:
     """
-    Gửi PNG + data text đến Gemini Vision, nhận về phân tích tiếng Việt.
+    Gửi TEXT-ONLY (các chỉ số breadth) đến Gemini, nhận về phân tích tiếng Việt.
+    Không gửi ảnh — tránh lỗi 404 do payload quá lớn.
     API key đọc hoàn toàn từ os.environ — không bao giờ hardcode.
 
     Returns
     -------
     str  — nội dung phân tích, hoặc fallback text nếu lỗi
     """
-    # Đọc API key từ environment — bảo mật tuyệt đối
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
         logger.error("GEMINI_API_KEY not set — kiểm tra GitHub Secrets hoặc file .env")
         return "❌ Không thể phân tích: thiếu GEMINI_API_KEY."
-
-    # Nén ảnh trước khi encode — ảnh gốc có thể > 10MB, quá lớn cho REST API
-    png_bytes = _compress_image_for_api(chart_png_path)
-    b64_image = base64.b64encode(png_bytes).decode("utf-8")
 
     today_str    = date.today().strftime("%d/%m/%Y")
     metrics_text = _build_metrics_text(breadth)
@@ -171,21 +167,16 @@ def analyse_with_gemini(
         metrics_text=metrics_text,
     )
 
+    # Text-only payload — không gửi ảnh, tránh 404 do payload quá lớn
     payload = {
         "contents": [{
             "parts": [
-                {
-                    "inline_data": {
-                        "mime_type": "image/png",
-                        "data": b64_image,
-                    }
-                },
                 {"text": prompt_text},
             ]
         }],
         "generationConfig": {
             "temperature":     0.3,
-            "maxOutputTokens": 1000,
+            "maxOutputTokens": 1200,
         },
     }
 
@@ -207,52 +198,6 @@ def analyse_with_gemini(
         return f"❌ Gemini lỗi: {exc}\n\n📊 Dữ liệu thô:\n{metrics_text}"
 
 
-def _compress_image_for_api(chart_png_path: str) -> bytes:
-    """
-    Nén ảnh chart về kích thước nhỏ hơn trước khi gửi qua Gemini REST API.
-
-    Vấn đề: Ảnh gốc 18×16 inch @ 150dpi = 2700×2400px → base64 ≈ 10–15 MB
-    → Vượt giới hạn payload của Gemini REST API → lỗi 404.
-
-    Giải pháp: Re-render về 12×9 inch @ 96dpi ≈ 1152×864px → ≈ 0.5–1 MB.
-    Dùng matplotlib (dependency có sẵn) — không cần thêm thư viện mới.
-    """
-    import io
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import matplotlib.image as mpimg
-
-    original_size_mb = Path(chart_png_path).stat().st_size / 1_000_000
-
-    try:
-        img_arr = mpimg.imread(chart_png_path)
-        # Re-render ở resolution thấp hơn: 12×9 inch @ 96dpi = 1152×864px
-        fig, ax = plt.subplots(figsize=(12, 9), dpi=96)
-        ax.imshow(img_arr, aspect="auto")
-        ax.axis("off")
-        plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
-        buf = io.BytesIO()
-        fig.savefig(buf, format="png", dpi=96, bbox_inches="tight", pad_inches=0)
-        plt.close(fig)
-        buf.seek(0)
-        compressed = buf.read()
-        compressed_mb = len(compressed) / 1_000_000
-        logger.info(
-            "Image compressed for API: %.1f MB → %.1f MB (%.0f%% reduction)",
-            original_size_mb,
-            compressed_mb,
-            (1 - compressed_mb / original_size_mb) * 100 if original_size_mb > 0 else 0,
-        )
-        return compressed
-    except Exception as exc:
-        logger.warning(
-            "Image compression failed (%s) — sending original %.1f MB (may cause 404)",
-            exc, original_size_mb,
-        )
-        return Path(chart_png_path).read_bytes()
-
-
 # ---------------------------------------------------------------------------
 # Telegram
 # ---------------------------------------------------------------------------
@@ -265,7 +210,6 @@ def send_telegram(
     Gửi ảnh + text phân tích qua Telegram.
     Token và chat_id đọc hoàn toàn từ os.environ — không bao giờ hardcode.
     """
-    # Đọc credentials từ environment — bảo mật tuyệt đối
     token   = os.environ.get("TELEGRAM_TOKEN", "").strip()
     chat_id = os.environ.get("TELEGRAM_ID", "").strip()
 
@@ -279,7 +223,7 @@ def send_telegram(
     base_url = f"https://api.telegram.org/bot{token}"
     success  = True
 
-    # Message 1: ảnh chart (không caption)
+    # Message 1: ảnh chart PNG (để user xem trực quan)
     if image_path and Path(image_path).exists():
         try:
             with open(image_path, "rb") as img:
@@ -295,7 +239,7 @@ def send_telegram(
             logger.warning("Telegram sendPhoto failed: %s", exc)
             success = False
 
-    # Message 2: text phân tích
+    # Message 2: text phân tích từ Gemini
     if not _send_text_message(base_url, chat_id, text):
         success = False
 
@@ -310,12 +254,9 @@ def _text_to_html(text: str) -> str:
 
 
 def _send_text_message(base_url: str, chat_id: str, text: str) -> bool:
-    """
-    Gửi message với HTML parse mode.
-    Fallback về plain text nếu HTML parsing lỗi.
-    """
+    """Gửi message với HTML parse mode. Fallback về plain text nếu lỗi."""
     MAX_LEN = 4000
-    success = True
+    success  = True
 
     html_text = _text_to_html(text)
     chunks = [html_text[i: i + MAX_LEN] for i in range(0, len(html_text), MAX_LEN)]
@@ -376,35 +317,36 @@ def notify_daily(
 ) -> None:
     """
     Hàm duy nhất được gọi từ main.py:
-      1. Gemini phân tích chart + data (6 panels mới)
-      2. Gửi Telegram: ảnh + phân tích
+      1. Gemini phân tích TEXT chỉ số breadth (không gửi ảnh lên Gemini)
+      2. Telegram: gửi ảnh PNG (để xem) + text phân tích Gemini
 
+    Ảnh PNG vẫn được gửi qua Telegram — chỉ là Gemini không đọc ảnh nữa.
     Lỗi được log nhưng không raise để không crash pipeline chính.
     """
     today_str = date.today().strftime("%d/%m/%Y")
-    logger.info("=== Gemini analysis (v2.0 — 6-panel dashboard) ===")
+    logger.info("=== Gemini text analysis (v2.1 — text-only, no image upload) ===")
 
     try:
-        analysis = analyse_with_gemini(chart_png_path, breadth)
+        analysis = analyse_with_gemini(breadth)
     except Exception as exc:
         logger.error("analyse_with_gemini crashed: %s", exc)
         analysis = f"❌ Lỗi phân tích Gemini: {exc}"
 
-    # Lấy composite score và regime cho header
+    # Header với Composite Score và Regime
     composite_str = ""
     regime_str    = ""
     if not breadth.empty:
         last = breadth.dropna(how="all").iloc[-1]
         cs   = last.get("composite_score")
         rg   = last.get("regime")
-        if cs is not None and not pd.isna(cs):
+        if cs is not None and not (isinstance(cs, float) and np.isnan(cs)):
             composite_str = f" | Score: {cs:.0f}/100"
-        if rg is not None and not pd.isna(rg):
+        if rg is not None and not (isinstance(rg, float) and np.isnan(rg)):
             regime_icons = {1: "🟢 Bull", 0: "🟡 Transition", -1: "🔴 Bear"}
             regime_str = f" | {regime_icons.get(int(rg), '')}"
 
     header = (
-        f"📈 **VN-Index Breadth Report v2.0**\n"
+        f"📈 **VN-Index Breadth Report v2.1**\n"
         f"📅 {today_str}{composite_str}{regime_str}\n"
         f"{'─' * 34}\n\n"
     )
