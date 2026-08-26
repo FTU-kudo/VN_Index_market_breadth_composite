@@ -34,3 +34,6 @@ Thumbs.db
 # Secrets
 .env
 secrets.json
+
+# Notes
+HANDOFF.md
