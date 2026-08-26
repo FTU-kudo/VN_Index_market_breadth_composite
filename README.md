@@ -71,14 +71,14 @@ Thay vì chỉ nhìn vào giá VN-Index, hệ thống này đo lường **"sức
 
 ```
 ┌──────────────────────────┬──────────────────────────┐
-│  % Stocks Above MA       │  ADL + High-Low Line      │
-│  + VN-Index overlay      │  + McClellan Osc          │
+│  % Stocks Above MA       │  ADL + High-Low Line     │
+│  + VN-Index overlay      │  + McClellan Osc         │
 ├──────────────────────────┼──────────────────────────┤
-│  McClellan Osc/Sum       │  Net A/D Ratio %          │
-│  (bar + dual axis)       │  + Breadth Thrust         │
+│  McClellan Osc/Sum       │  Net A/D Ratio %         │
+│  (bar + dual axis)       │  + Breadth Thrust        │
 ├──────────────────────────┼──────────────────────────┤
-│  Volume Breadth          │  Composite Score          │
-│  UpVol% + TRIN           │  + Regime Shading         │
+│  Volume Breadth          │  Composite Score         │
+│  UpVol% + TRIN           │  + Regime Shading        │
 └──────────────────────────┴──────────────────────────┘
 ```
 
