@@ -33,7 +33,7 @@ import requests
 logger = logging.getLogger(__name__)
 
 
-GEMINI_MODEL   = "gemini-2.5-flash-lite"
+GEMINI_MODEL   = "gemini-3.5-flash-lite"
 _ANALYSIS_PROMPT = """
 Bạn là một chuyên gia phân tích thị trường chứng khoán Việt Nam (HOSE) với 10 năm kinh nghiệm, nổi tiếng với lối phân tích thực chiến, sắc bén và cô đọng.
 
