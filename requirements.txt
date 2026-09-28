@@ -3,6 +3,9 @@ vnstock>=4.0.0
 pandas>=2.0.0
 numpy>=1.24.0
 pyarrow>=14.0.0
+--extra-index-url https://vnstocks.com/api/simple
+vnstock
+vnai
 
 # Excel export
 XlsxWriter>=3.1.0
