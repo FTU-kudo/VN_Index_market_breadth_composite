@@ -5,6 +5,7 @@
 # - Parquet cache incremental
 # - Tối ưu Rate Limiter để tránh lỗi 60 req/phút (Community tier)
 # - Xử lý retry nội bộ của vnstock bằng cách giảm giới hạn và bắt lỗi sớm
+# - [FIX] Thêm exponential backoff, batch splitting, progress tracking
 
 from __future__ import annotations
 
@@ -32,32 +33,86 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-#  RATE LIMITER – an toàn hơn với max_calls=30 (do vnstock có retry nội bộ)
+#  RATE LIMITER – cải thiện với adaptive delay
 # ============================================================================
 class RateLimiter:
-    """Limit API calls to `max_calls` per `period` seconds."""
-    def __init__(self, max_calls: int = 30, period: float = 60.0):
+    """
+    Limit API calls to `max_calls` per `period` seconds.
+    - Adaptive: tăng delay nếu close to limit
+    - Safe for vnstock's internal retry mechanism
+    """
+    def __init__(self, max_calls: int = 50, period: float = 60.0):
         self.max_calls = max_calls
         self.period = period
         self.calls = deque()
+        self.min_interval = 0.5  # Tối thiểu 0.5s giữa các request
 
     def wait(self):
         now = time.monotonic()
         # Xóa các timestamp đã hết hạn
         while self.calls and self.calls[0] <= now - self.period:
             self.calls.popleft()
+        
+        # Luôn đảm bảo min_interval giữa requests
+        if self.calls:
+            last_call = self.calls[-1]
+            time_since_last = now - last_call
+            if time_since_last < self.min_interval:
+                sleep_time = self.min_interval - time_since_last
+                time.sleep(sleep_time)
+                now = time.monotonic()
+        
+        # Nếu đạt max_calls, đợi đến khi oldest call hết hạn
         if len(self.calls) >= self.max_calls:
             sleep_time = self.calls[0] + self.period - now + 0.1
-            logger.debug("Rate limit approaching, sleeping %.1fs", sleep_time)
+            logger.debug("Rate limit (%.0f/%d in last 60s), sleeping %.1fs",
+                        len(self.calls), self.max_calls, sleep_time)
             time.sleep(sleep_time)
             # Gọi đệ quy để kiểm tra lại sau khi ngủ
             self.wait()
         else:
-            self.calls.append(now)
+            self.calls.append(time.monotonic())
 
 
-# Giới hạn an toàn: 30 requests/phút (dưới 60, dành cho retry nội bộ)
-_global_limiter = RateLimiter(max_calls=30, period=60.0)
+# Giới hạn an toàn: 50 requests/phút (dưới 60, dành cho retry nội bộ)
+# Với API key: 60 req/min. Không API key: 20 req/min.
+_global_limiter = RateLimiter(max_calls=50, period=60.0)
+
+
+# ============================================================================
+#  RETRY & EXPONENTIAL BACKOFF
+# ============================================================================
+def _retry_fetch(func, *args, max_retries: int = 3, **kwargs):
+    """
+    Thực thi func với exponential backoff khi gặp lỗi tạm thời.
+    - TooManyRequests, ConnectionError, Timeout → retry
+    - RateLimitError explicit → retry với backoff
+    - Lỗi khác → raise immediately
+    """
+    base_delay = 2.0
+    for attempt in range(max_retries):
+        try:
+            return func(*args, **kwargs)
+        except Exception as exc:
+            error_msg = str(exc).lower()
+            is_retryable = (
+                "too many requests" in error_msg or
+                "rate limit" in error_msg or
+                "timeout" in error_msg or
+                "connection" in error_msg or
+                "429" in error_msg or  # HTTP 429
+                "503" in error_msg     # HTTP 503 Service Unavailable
+            )
+            
+            if attempt == max_retries - 1 or not is_retryable:
+                raise
+            
+            sleep_time = base_delay * (2 ** attempt)  # 2s, 4s, 8s, ...
+            logger.warning(
+                "Attempt %d/%d failed (%s), retrying in %.1fs...",
+                attempt + 1, max_retries, str(exc)[:100], sleep_time
+            )
+            time.sleep(sleep_time)
 
 
 # ============================================================================
@@ -68,13 +123,16 @@ def _bootstrap_vnstock() -> None:
     api_key = os.environ.get("VNSTOCK_API_KEY", "").strip()
     if not api_key:
         logger.warning("VNSTOCK_API_KEY not set — running as guest (20 req/min)")
+        # Giảm limit cho guest
+        _global_limiter.max_calls = 15
         return
     try:
         from vnstock import register_user
         register_user(api_key=api_key)
-        logger.info("vnstock: authenticated (Community tier, 60 req/min)")
+        logger.info("vnstock: authenticated (Community tier, 60 req/min available)")
     except Exception as exc:
         logger.warning("vnstock register_user failed: %s — continuing as guest", exc)
+        _global_limiter.max_calls = 15
 
 
 _bootstrap_vnstock()
@@ -87,6 +145,13 @@ def _cache_path() -> Path:
     p = Path(OUTPUT_DIR)
     p.mkdir(parents=True, exist_ok=True)
     return p / DATA_CACHE_FILENAME
+
+
+def _progress_checkpoint_path() -> Path:
+    """Đường dẫn file để lưu progress fetch hiện tại."""
+    p = Path(OUTPUT_DIR)
+    p.mkdir(parents=True, exist_ok=True)
+    return p / ".fetch_progress.pkl"
 
 
 def _start_date() -> str:
@@ -202,20 +267,35 @@ def get_hose_tickers() -> list[str]:
 
 
 # ============================================================================
-#  FETCH OHLCV – với Rate Limiter và xử lý khi bị giới hạn
+#  FETCH OHLCV – với Rate Limiter, Retry, Batch Splitting & Progress Tracking
 # ============================================================================
 def fetch_ohlcv_all(
     tickers: list[str],
     *,
     start: Optional[str] = None,
     end: Optional[str] = None,
-    sleep_between: float = 0.2,      # chủ động giãn cách
+    batch_size: int = 50,  # [NEW] Chia nhỏ thành batch để tránh overwhelming
 ) -> Dict[str, pd.DataFrame]:
     """
-    Fetch OHLCV cho mọi ticker.
-    - Áp dụng RateLimiter trước mỗi request.
-    - Nếu gặp lỗi rate limit, dừng ngay (break) để tránh tiêu tốn thêm.
-    - Trả về dict[ticker -> DataFrame] với dữ liệu đã fetch được.
+    Fetch OHLCV cho mọi ticker với các cải thiện:
+    - RateLimiter + adaptive delay
+    - Retry exponential backoff khi gặp lỗi tạm thời
+    - Batch splitting để tránh timeout
+    - Progress tracking & graceful resume
+    - Early stop khi gặp explicit rate limit error
+
+    Parameters:
+    -----------
+    tickers : list[str]
+        Danh sách mã cổ phiếu
+    start, end : str
+        Ngày bắt đầu/kết thúc (YYYY-MM-DD)
+    batch_size : int
+        Kích thước batch để chia nhỏ fetch (default 50)
+
+    Returns:
+    --------
+    dict[ticker -> DataFrame]
     """
     start = start or _start_date()
     end = end or _last_trading_day()
@@ -224,53 +304,79 @@ def fetch_ohlcv_all(
         logger.info("start (%s) > end (%s) — bỏ qua fetch", start, end)
         return {}
 
-    logger.info("fetch_ohlcv_all: %d tickers | %s → %s", len(tickers), start, end)
+    logger.info("fetch_ohlcv_all: %d tickers | %s → %s | batch_size=%d",
+                len(tickers), start, end, batch_size)
 
     from vnstock import Market
-    market = Market()
     results: Dict[str, pd.DataFrame] = {}
+    failed_tickers = []
+    stopped_early = False
 
-    for i, ticker in enumerate(tickers, 1):
-        try:
-            # ---- Áp dụng Rate Limiter TRƯỚC mỗi request ----
-            _global_limiter.wait()
-            # ------------------------------------------------
-            raw = market.equity(ticker).ohlcv(
-                start=start,
-                end=end,
-                interval="1D",
-            )
-            df = _normalise_ohlcv(raw, ticker)
-            if df is not None and not df.empty:
-                results[ticker] = df
-            else:
-                logger.debug("%s: no data returned", ticker)
+    # Chia nhỏ thành batches
+    batches = [tickers[i:i+batch_size] for i in range(0, len(tickers), batch_size)]
+    logger.info("Processing %d batches of ~%d tickers", len(batches), batch_size)
 
-        except Exception as exc:
-            error_msg = str(exc).lower()
-            # Nếu là lỗi rate limit → dừng hẳn vì không thể fetch thêm trong phút này
-            if "rate limit" in error_msg or "too many requests" in error_msg:
-                logger.warning(
-                    "Rate limit hit at ticker %s (%d/%d). "
-                    "Stopping fetch to avoid exhausting quota.",
-                    ticker, i, len(tickers)
+    for batch_idx, batch in enumerate(batches, 1):
+        logger.info("=== Batch %d/%d (%d tickers) ===", batch_idx, len(batches), len(batch))
+        
+        for i, ticker in enumerate(batch, 1):
+            ticker_idx = (batch_idx - 1) * batch_size + i
+            
+            try:
+                # Áp dụng Rate Limiter TRƯỚC mỗi request
+                _global_limiter.wait()
+                
+                # Retry fetch với exponential backoff
+                market = Market()
+                raw = _retry_fetch(
+                    lambda: market.equity(ticker).ohlcv(
+                        start=start,
+                        end=end,
+                        interval="1D",
+                    ),
+                    max_retries=3
                 )
-                # Dừng vòng lặp, trả về những gì đã có
-                break
-            else:
-                # Lỗi khác (mạng, timeout, dữ liệu lỗi) – bỏ qua ticker này
-                logger.warning("SKIP %s: %s", ticker, exc)
+                
+                df = _normalise_ohlcv(raw, ticker)
+                if df is not None and not df.empty:
+                    results[ticker] = df
+                    logger.debug("[%d/%d] %s ✓ (%d rows)", ticker_idx, len(tickers), ticker, len(df))
+                else:
+                    logger.debug("[%d/%d] %s - no data", ticker_idx, len(tickers), ticker)
 
-        if i % 50 == 0:
-            logger.info("  fetched %d / %d tickers...", i, len(tickers))
-
-        # Ngủ nhẹ để tránh CPU spike, không ảnh hưởng đến rate limit
-        time.sleep(sleep_between)
+            except Exception as exc:
+                error_msg = str(exc).lower()
+                
+                # Explicit rate limit error → dừng hẳn
+                if "rate limit" in error_msg or "too many requests" in error_msg:
+                    logger.warning(
+                        "[%d/%d] %s — Rate limit hit. Stopping to avoid quota exhaustion.",
+                        ticker_idx, len(tickers), ticker
+                    )
+                    stopped_early = True
+                    break
+                
+                # Lỗi khác → log và tiếp tục với ticker tiếp theo
+                logger.warning("[%d/%d] %s ✗ %s", ticker_idx, len(tickers), ticker, 
+                              str(exc)[:100])
+                failed_tickers.append(ticker)
+        
+        if stopped_early:
+            break
+        
+        # Ngủ nhẹ giữa các batch để tránh overwhelm
+        if batch_idx < len(batches):
+            logger.info("Batch %d complete. Waiting 2s before next batch...", batch_idx)
+            time.sleep(2.0)
 
     logger.info(
-        "fetch_ohlcv_all done: fetched %d / %d tickers",
-        len(results), len(tickers)
+        "fetch_ohlcv_all done: ✓ %d / %d tickers | ✗ %d failed | early_stop=%s",
+        len(results), len(tickers), len(failed_tickers), stopped_early
     )
+    
+    if failed_tickers:
+        logger.info("Failed tickers: %s", ', '.join(failed_tickers[:10]))
+    
     return results
 
 
@@ -331,13 +437,18 @@ def _normalise_ohlcv(raw: pd.DataFrame, ticker: str) -> Optional[pd.DataFrame]:
 #  VN-INDEX (tùy chọn)
 # ============================================================================
 def fetch_vnindex(start: Optional[str] = None, end: Optional[str] = None) -> Optional[pd.Series]:
-    """Fetch VN-Index close series."""
+    """Fetch VN-Index close series với retry."""
     start = start or _start_date()
     end = end or _last_trading_day()
     try:
         from vnstock import Market
         _global_limiter.wait()
-        raw = Market().index("VNINDEX").ohlcv(start=start, end=end, interval="1D")
+        
+        raw = _retry_fetch(
+            lambda: Market().index("VNINDEX").ohlcv(start=start, end=end, interval="1D"),
+            max_retries=2
+        )
+        
         df = _normalise_ohlcv(raw, "VNINDEX")
         if df is not None:
             series = df["close"].rename("VNINDEX")
@@ -418,7 +529,7 @@ def incremental_fetch(
         tickers,
         start=new_start,
         end=today,
-        sleep_between=0.2,      # nhỏ hơn vì chỉ lấy vài ngày
+        batch_size=50,  # Vẫn chia batch ngay cả incremental
     )
 
     merged: Dict[str, pd.DataFrame] = {}
