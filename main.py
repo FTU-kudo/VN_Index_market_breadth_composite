@@ -61,6 +61,7 @@ def main() -> int:
             logger.error("Không có cache — cần chạy full fetch ngày thường trước")
             return 1
         ohlcv = cached
+        quota_exhausted = False
     else:
         # 1 — Ticker list
         logger.info("=== STEP 1: Ticker list ===")
@@ -71,17 +72,39 @@ def main() -> int:
         logger.info("=== STEP 2: OHLCV fetch ===")
         if args.full:
             from breadth_composite.data_loader import fetch_ohlcv_all
-            ohlcv = fetch_ohlcv_all(tickers)
+            ohlcv, quota_exhausted = fetch_ohlcv_all(tickers)
         else:
-            ohlcv = incremental_fetch(load_cache(), tickers)
-        logger.info("OHLCV loaded: %d tickers", len(ohlcv))
+            ohlcv, quota_exhausted = incremental_fetch(load_cache(), tickers)
+        
+        logger.info("OHLCV loaded: %d tickers (quota_exhausted=%s)", len(ohlcv), quota_exhausted)
+        
+        # If quota exhausted and we have no/minimal data, fall back to cache
+        if quota_exhausted and len(ohlcv) < 50:
+            logger.warning(
+                "Quota exhausted with only %d tickers — attempting to use cached data",
+                len(ohlcv)
+            )
+            cached = load_cache()
+            if cached:
+                logger.info("Loaded %d tickers from cache", len(cached))
+                ohlcv = cached
+            else:
+                logger.error("No cache available and fetch incomplete — cannot proceed")
+                return 1
 
-        # 3 — Save cache
+        # 3 — Save cache (only if we got new data)
         logger.info("=== STEP 3: Save cache ===")
-        save_cache(ohlcv)
+        if len(ohlcv) > 0:
+            save_cache(ohlcv)
+        else:
+            logger.warning("No OHLCV data to cache")
 
   
     # 4 — Compute breadth
+    if not ohlcv:
+        logger.error("No OHLCV data available — cannot compute breadth")
+        return 1
+    
     logger.info("=== STEP 4: Compute breadth ===")
     breadth = compute_all(ohlcv)
     logger.info(
