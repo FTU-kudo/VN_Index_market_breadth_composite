@@ -1,11 +1,15 @@
+# main.py
 """
 main.py — Breadth Composite Pipeline Orchestrator
 
 Usage:
   python main.py               # incremental (default)
   python main.py --full        # full 6-year re-fetch
-  python main.py --dry-run     # compute only, no Excel/email
-  python main.py --send-email  # email Excel sau khi export
+  python main.py --dry-run     # compute only, no cache/Excel/chart/Telegram
+  python main.py --send-email  # email Excel after export
+
+Data comes from the price-board + history endpoints via breadth_composite.yuanta_api.
+No API-key bootstrap is needed; GEMINI_API_KEY / TELEGRAM_* are only used by notify.
 """
 
 from __future__ import annotations
@@ -25,8 +29,8 @@ logger = logging.getLogger("main")
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Breadth Composite Pipeline")
-    p.add_argument("--full",       action="store_true")
-    p.add_argument("--dry-run",    action="store_true")
+    p.add_argument("--full",       action="store_true", help="re-download the whole window")
+    p.add_argument("--dry-run",    action="store_true", help="compute only, write nothing")
     p.add_argument("--send-email", action="store_true")
     p.add_argument("--output-dir", default=None)
     return p.parse_args()
@@ -35,94 +39,88 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
 
+    # Config is patched before the package is imported, so every module sees it.
     if args.output_dir:
         import breadth_composite.config as cfg
         cfg.OUTPUT_DIR = args.output_dir
 
     from breadth_composite import (
-        compute_all, export_excel,
-        get_hose_tickers, incremental_fetch,
-        load_cache, save_cache,
+        compute_all,
+        export_excel,
+        fetch_vnindex,
+        get_hose_tickers,
+        incremental_fetch,
+        latest_session_date,
+        load_cache,
+        save_cache,
     )
+    from breadth_composite.config import HISTORY_PRICE_UNIT
 
-    # 0 — Weekend guard toàn pipeline
-    import datetime
-    dow = datetime.date.today().weekday()
-    if dow >= 5 and not args.full:
-        logger.info(
-            "Hôm nay là %s — thị trường đóng, pipeline dùng cache cũ.",
-            ["T2","T3","T4","T5","T6","T7","CN"][dow],
-        )
-        # Vẫn chạy compute + export + notify nhưng skip fetch
-        from breadth_composite import load_cache, compute_all, export_excel
-        from breadth_composite.data_loader import fetch_vnindex
-        cached = load_cache()
-        if not cached:
-            logger.error("Không có cache — cần chạy full fetch ngày thường trước")
-            return 1
-        ohlcv = cached
-        quota_exhausted = False
+    session = latest_session_date()
+    logger.info("Last finished session (Vietnam time): %s | prices in %s", session, HISTORY_PRICE_UNIT)
+
+    # 1 — Universe (one price-board call)
+    logger.info("=== STEP 1: Universe ===")
+    tickers = get_hose_tickers()
+    if not tickers:
+        logger.error("Empty universe — aborting instead of publishing an empty report")
+        return 1
+    logger.info("Universe: %d symbols", len(tickers))
+
+    # 2 — OHLCV
+    logger.info("=== STEP 2: OHLCV fetch ===")
+    cached = load_cache()
+    if args.full:
+        from breadth_composite import fetch_ohlcv_all
+        from breadth_composite.data_loader import combine_with_cache
+        fresh, fetch_degraded = fetch_ohlcv_all(tickers)
+        # A full re-download replaces each symbol it returns, but a symbol that
+        # failed mid-run keeps its cached history instead of disappearing.
+        ohlcv = combine_with_cache(cached, fresh, tickers)
     else:
-        # 1 — Ticker list
-        logger.info("=== STEP 1: Ticker list ===")
-        tickers = get_hose_tickers()
-        logger.info("Universe: %d tickers", len(tickers))
+        ohlcv, fetch_degraded = incremental_fetch(cached, tickers)
 
-        # 2 — OHLCV
-        logger.info("=== STEP 2: OHLCV fetch ===")
-        if args.full:
-            from breadth_composite.data_loader import fetch_ohlcv_all
-            ohlcv, quota_exhausted = fetch_ohlcv_all(tickers)
-        else:
-            ohlcv, quota_exhausted = incremental_fetch(load_cache(), tickers)
-        
-        logger.info("OHLCV loaded: %d tickers (quota_exhausted=%s)", len(ohlcv), quota_exhausted)
-        
-        # If quota exhausted and we have no/minimal data, fall back to cache
-        if quota_exhausted and len(ohlcv) < 50:
-            logger.warning(
-                "Quota exhausted with only %d tickers — attempting to use cached data",
-                len(ohlcv)
-            )
-            cached = load_cache()
-            if cached:
-                logger.info("Loaded %d tickers from cache", len(cached))
-                ohlcv = cached
-            else:
-                logger.error("No cache available and fetch incomplete — cannot proceed")
-                return 1
+    logger.info("OHLCV ready: %d symbols (degraded=%s)", len(ohlcv), fetch_degraded)
 
-        # 3 — Save cache (only if we got new data)
-        logger.info("=== STEP 3: Save cache ===")
-        if len(ohlcv) > 0:
-            save_cache(ohlcv)
-        else:
-            logger.warning("No OHLCV data to cache")
+    # A partial run is worse than yesterday's cache: keep the cache when the
+    # fetch collapsed, and never publish a report built on a handful of symbols.
+    coverage = len(ohlcv) / max(1, len(tickers))
+    if fetch_degraded and coverage < 0.5 and cached:
+        logger.warning(
+            "Fetch covered only %.0f%% of the universe — falling back to the %d-symbol cache",
+            coverage * 100, len(cached),
+        )
+        ohlcv = cached
 
-  
-    # 4 — Compute breadth
     if not ohlcv:
         logger.error("No OHLCV data available — cannot compute breadth")
         return 1
-    
+
+    # 3 — Cache (skipped on dry-run so a test run cannot poison it)
+    if args.dry_run:
+        logger.info("=== STEP 3: cache save skipped (--dry-run) ===")
+    else:
+        logger.info("=== STEP 3: Save cache ===")
+        save_cache(ohlcv)
+
+    # 4 — Compute breadth
     logger.info("=== STEP 4: Compute breadth ===")
     breadth = compute_all(ohlcv)
     logger.info(
         "Tail:\n%s",
         breadth[["pct_above_ma50", "pct_above_ma200",
-                  "adl", "mcclellan_osc", "net_new_highs_pct"]].tail(3).to_string()
+                 "adl", "mcclellan_osc", "net_new_highs_pct"]].tail(3).to_string(),
     )
 
-    # 5 — VN-Index overlay (best-effort)
+    # 5 — VN-Index overlay (best effort)
     logger.info("=== STEP 5: VN-Index close ===")
-    from breadth_composite.data_loader import fetch_vnindex
     vnindex = fetch_vnindex()
 
-    # 6 — Export
     if args.dry_run:
-        logger.info("--dry-run: skipping export & email")
+        logger.info("--dry-run: skipping export, chart and notifications")
         return 0
 
+    # 6 — Export Excel
     logger.info("=== STEP 6: Export Excel ===")
     excel_path = export_excel(breadth, vnindex=vnindex)
     logger.info("Excel: %s", excel_path)
@@ -138,7 +136,7 @@ def main() -> int:
     from breadth_composite.notify import notify_daily
     notify_daily(breadth, chart_png_path=chart_path)
 
-    # 9 — Email (disabled by default, keep for future use)
+    # 9 — Email (disabled by default, kept for future use)
     if args.send_email:
         logger.info("=== STEP 9: Send email ===")
         _send_email(excel_path)
@@ -170,7 +168,7 @@ def _send_email(excel_path: str) -> None:
         f"<h3>VN-Index Market Breadth — {today_str}</h3>"
         "<p>File đính kèm: báo cáo breadth composite HOSE hôm nay.<br>"
         "Bao gồm: % stocks above MA20/50/200, ADL, McClellan Oscillator, "
-        "Net New 52W Highs/Lows.</p>"
+        "Net New Highs/Lows.</p>"
         "<p><em>Auto-generated by breadth_composite pipeline.</em></p>",
         "html", "utf-8"
     ))

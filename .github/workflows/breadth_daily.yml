@@ -1,3 +1,4 @@
+# .github/workflows/breadth_daily.yml
 name: Breadth Composite Daily
 
 on:
@@ -17,12 +18,24 @@ on:
         description: "Send email after export (true/false)"
         required: false
         default: "false"
+      probe_only:
+        description: "Only run the live endpoint probe, skip the pipeline (true/false)"
+        required: false
+        default: "false"
+
+permissions:
+  contents: read
+
+# One writer at a time: two runs would race on the OHLCV cache.
+concurrency:
+  group: breadth-composite
+  cancel-in-progress: false
 
 jobs:
   build:
     name: Build Breadth Report
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 120
 
     steps:
       - name: Checkout
@@ -35,43 +48,78 @@ jobs:
           cache: "pip"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
 
+      - name: Run test suite
+        run: python -m pytest
+
+      # A per-run cache key is required: Actions caches are immutable, so a
+      # fixed key would freeze the Parquet at the first successful run and every
+      # later "incremental" run would start from that stale snapshot.
       - name: Restore OHLCV cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: output/breadth_data_cache.parquet
-          key: ohlcv-cache-${{ runner.os }}-${{ hashFiles('breadth_composite/config.py') }}
+          key: ohlcv-cache-${{ runner.os }}-${{ github.run_id }}
           restore-keys: |
             ohlcv-cache-${{ runner.os }}-
 
+      - name: Probe endpoints (diagnostic)
+        if: github.event.inputs.probe_only == 'true'
+        run: python tools/probe_yuanta.py --json output/probe_yuanta.json
+
       - name: Run pipeline
+        if: github.event.inputs.probe_only != 'true'
         env:
-          PYTHONUNBUFFERED:  "1"
-          VNSTOCK_API_KEY:   ${{ secrets.VNSTOCK_API_KEY }}
-          GEMINI_API_KEY:    ${{ secrets.GEMINI_API_KEY }}
-          TELEGRAM_TOKEN:    ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_ID:       ${{ secrets.TELEGRAM_ID }}
+          PYTHONUNBUFFERED: "1"
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_ID:    ${{ secrets.TELEGRAM_ID }}
         run: |
-          FULL_FLAG=""
+          FLAGS=""
           if [ "${{ github.event.inputs.full_fetch }}" = "true" ] || \
              [ "${{ github.event.client_payload.full_fetch }}" = "true" ]; then
-            FULL_FLAG="--full"
+            FLAGS="$FLAGS --full"
           fi
-          python main.py $FULL_FLAG
+          if [ "${{ github.event.inputs.send_email }}" = "true" ]; then
+            FLAGS="$FLAGS --send-email"
+          fi
+          echo "python main.py ${FLAGS}"
+          python main.py ${FLAGS}
+
+      - name: Save OHLCV cache
+        if: always() && hashFiles('output/breadth_data_cache.parquet') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: output/breadth_data_cache.parquet
+          key: ohlcv-cache-${{ runner.os }}-${{ github.run_id }}
 
       - name: Upload Excel artifact
         uses: actions/upload-artifact@v4
         with:
           name: breadth-report-${{ github.run_id }}
           path: output/breadth_composite.xlsx
+          if-no-files-found: warn
           retention-days: 30
 
-      - name: Save OHLCV cache
-        uses: actions/cache/save@v4
+      - name: Upload probe report
+        if: always() && hashFiles('output/probe_yuanta.json') != ''
+        uses: actions/upload-artifact@v4
         with:
-          path: output/breadth_data_cache.parquet
-          key: ohlcv-cache-${{ runner.os }}-${{ hashFiles('breadth_composite/config.py') }}
+          name: probe-report-${{ github.run_id }}
+          path: output/probe_yuanta.json
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload chart artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: breadth-chart-${{ github.run_id }}
+          path: output/breadth_chart.png
+          if-no-files-found: warn
+          retention-days: 30
 
   send-email:
     name: Send Email Report

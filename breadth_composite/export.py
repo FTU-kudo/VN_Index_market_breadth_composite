@@ -1,3 +1,4 @@
+# breadth_composite/export.py
 """
 export.py — Excel Export Engine (v2.0)
 
@@ -20,7 +21,8 @@ from typing import Optional
 import pandas as pd
 import xlsxwriter
 
-from .config import CHART_DISPLAY_YEARS, EXCEL_FILENAME, OUTPUT_DIR
+from . import config as _config
+from .config import CHART_DISPLAY_YEARS, EXCEL_FILENAME
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +45,8 @@ def export_excel(
     vnindex: Optional[pd.Series] = None,
     output_path: Optional[str] = None,
 ) -> str:
-    out = Path(output_path or (OUTPUT_DIR + "/" + EXCEL_FILENAME))
+    # Read config at call time: --output-dir patches config after import.
+    out = Path(output_path or (Path(_config.OUTPUT_DIR) / EXCEL_FILENAME))
     out.parent.mkdir(parents=True, exist_ok=True)
 
     cutoff   = pd.Timestamp(date.today() - timedelta(days=int(CHART_DISPLAY_YEARS * 365.25)))
