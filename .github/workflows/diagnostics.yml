@@ -1,0 +1,132 @@
+# .github/workflows/diagnostics.yml
+name: Diagnostics
+
+# Kiểm tra từng mảnh của hệ thống mà không chạy cả pipeline.
+# Mở Actions → Diagnostics → Run workflow → chọn task.
+
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        description: "Việc cần chạy"
+        required: true
+        type: choice
+        default: telegram_check
+        options:
+          - telegram_check          # token + chat hợp lệ? (không gửi tin nhắn)
+          - telegram_test_message   # gửi 1 tin nhắn test
+          - sample_report           # dashboard tổng hợp + gửi báo cáo mẫu (thử cả Gemini)
+          - endpoint_probe          # kiểm tra API dữ liệu thị trường
+
+permissions:
+  contents: read
+
+concurrency:
+  group: diagnostics
+  cancel-in-progress: false
+
+jobs:
+  run:
+    name: Diagnostics — ${{ inputs.task }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Sanity check (test suite)
+        run: python -m pytest
+
+      - name: Cấu hình secret (không in giá trị)
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_ID:    ${{ secrets.TELEGRAM_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          {
+            echo "### Task: \`${{ inputs.task }}\`"
+            echo ""
+            echo "| Secret | Trạng thái |"
+            echo "|---|---|"
+            for name in TELEGRAM_TOKEN TELEGRAM_ID GEMINI_API_KEY; do
+              value="${!name}"
+              if [ -n "$value" ]; then
+                echo "| $name | đã set (${#value} ký tự) |"
+              else
+                echo "| $name | **THIẾU** |"
+              fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: telegram_check
+        if: inputs.task == 'telegram_check'
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_ID:    ${{ secrets.TELEGRAM_ID }}
+        run: python tools/notify_test.py --check
+
+      - name: telegram_test_message
+        if: inputs.task == 'telegram_test_message'
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_ID:    ${{ secrets.TELEGRAM_ID }}
+        run: |
+          python tools/notify_test.py --send "✅ **Breadth pipeline** — tin nhắn test từ GitHub Actions
+          Run: ${{ github.run_id }} · ${{ github.ref_name }}"
+
+      - name: sample_report
+        if: inputs.task == 'sample_report'
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_ID:    ${{ secrets.TELEGRAM_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python tools/notify_test.py --sample-report --png output/sample_chart.png
+
+      - name: endpoint_probe
+        if: inputs.task == 'endpoint_probe'
+        run: python tools/probe_yuanta.py --json output/probe_yuanta.json
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostics-${{ inputs.task }}-${{ github.run_id }}
+          path: |
+            output/sample_chart.png
+            output/probe_yuanta.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Run summary
+        if: always()
+        run: |
+          {
+            echo ""
+            echo "### Cách đọc kết quả"
+            case "${{ inputs.task }}" in
+              telegram_check)
+                echo "- **ok** ở cả \`getMe\` và \`getChat\` → token/chat hợp lệ, chạy \`telegram_test_message\` để thử gửi."
+                echo "- **Unauthorized** → \`TELEGRAM_TOKEN\` sai hoặc đã bị thu hồi."
+                echo "- **chat not found** → \`TELEGRAM_ID\` sai, chưa /start bot, hoặc bot chưa được add vào group." ;;
+              telegram_test_message)
+                echo "- Mở Telegram, tin nhắn phải tới trong vài giây."
+                echo "- Không thấy tin → xem log step này (Telegram trả mô tả lỗi gốc)." ;;
+              sample_report)
+                echo "- Nhận được tin **có ảnh dashboard + nhận định** → toàn bộ đường đi đã đúng."
+                echo "- Tin có tiền tố ⚠️ *BÁO CÁO MẪU* nghĩa là dữ liệu tổng hợp, không phải thị trường thật." ;;
+              endpoint_probe)
+                echo "- Dùng output ở log/artifact để xác nhận universe, đơn vị giá và hành vi API." ;;
+            esac
+          } >> "$GITHUB_STEP_SUMMARY"

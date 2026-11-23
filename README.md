@@ -1,15 +1,16 @@
+<!-- README.md -->
 # 📊 VN-Index Market Breadth Composite
 
 <div align="center">
 
 ![Python](https://img.shields.io/badge/Python-3.11+-3776AB?style=for-the-badge&logo=python&logoColor=white)
-![vnstock](https://img.shields.io/badge/vnstock-4.0+-00BCD4?style=for-the-badge)
+![Tests](https://img.shields.io/badge/tests-pytest-0A9EDC?style=for-the-badge&logo=pytest&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)
 ![GitHub Actions](https://img.shields.io/badge/GitHub_Actions-Automated-2088FF?style=for-the-badge&logo=github-actions&logoColor=white)
 
 **Pipeline tự động phân tích độ rộng thị trường (Market Breadth) cho sàn HOSE — VN-Index**
 
-Tính toán 15+ chỉ báo breadth, render biểu đồ 3×2 panel, phân tích bằng Gemini AI và gửi báo cáo hàng ngày qua Telegram.
+Tính toán 24 chỉ báo breadth, render biểu đồ 3×2 panel, phân tích bằng Gemini AI và gửi báo cáo hàng ngày qua Telegram.
 
 </div>
 
@@ -26,9 +27,32 @@ Thay vì chỉ nhìn vào giá VN-Index, hệ thống này đo lường **"sức
 
 ---
 
+## 🔌 Nguồn dữ liệu (không dùng SDK bên thứ ba)
+
+Toàn bộ dữ liệu lấy trực tiếp qua HTTPS từ API của nhà cung cấp dữ liệu đã mua (Yuanta), trong **một module duy nhất** — `breadth_composite/yuanta_api.py`:
+
+| Dữ liệu | Endpoint | Ghi chú |
+|---|---|---|
+| Universe (mã niêm yết) | `GET /api/v3/market_data/price_board/stock/list_stock_info?exchange=HSX` | Giá tính bằng **VND**; lọc `SymbolType == "ST"` (cổ phiếu thường) |
+| Danh sách chỉ số | `GET /api/v3/market_data/price_board/index/list_index` | Dùng cho chẩn đoán (`tools/probe_yuanta.py`) |
+| OHLCV ngày | `GET /v2/tradingview/history?symbol=VIC&resolution=1D&from=…&to=…&limit=100000` | `t` = 00:00 UTC của ngày giao dịch; giá theo **nghìn VND**; `v` = cổ phiếu. Dùng được cho `symbol=VNINDEX` |
+
+Các đặc thù của API đã được xử lý sẵn trong client:
+
+- **`to` phải ở tương lai** mới nhận được bar của ngày hiện tại → mặc định `to = phiên hoàn tất gần nhất + 2 ngày`.
+- **Không bao giờ lưu phiên chưa kết thúc**: bar mới hơn `latest_session_date()` bị loại bỏ (cutoff **15:15 giờ Việt Nam**, cuối tuần lùi về thứ Sáu). Chạy trước giờ đóng cửa sẽ không ghi bar dở vào cache.
+- **Challenge của edge** (HTTP 200 + HTML "Attention Required" kèm `?jskey=…`) được theo tự động: chỉ host trong allowlist, tối đa 3 hop, cookie giữ theo từng thread.
+- **Lịch sử đã điều chỉnh (split/cổ tức)**: mỗi lần fetch incremental sẽ tải lại 15 ngày chồng lấn và so sánh với cache. Lệch > 0.5% ⇒ mã đó được tải lại **toàn bộ** lịch sử và **thay thế** cache (không merge), tránh trộn hai hệ giá.
+- **Mã mới** luôn được backfill đủ 6 năm, không phải chỉ từ "ngày mai".
+- Sau `MAX_CONSECUTIVE_FAILURES` lỗi liên tiếp, run dừng và trả cờ `degraded` để `main.py` giữ cache cũ thay vì xuất báo cáo dựa trên vài mã.
+
+Giá được giữ nguyên theo đơn vị của nhà cung cấp (nghìn VND). Breadth là chỉ báo không phụ thuộc thang giá, nên điều này không ảnh hưởng kết quả.
+
+---
+
 ## ✨ Tính năng
 
-### 📈 15+ Market Breadth Indicators (4 nhóm)
+### 📈 24 Market Breadth Indicators (4 nhóm)
 
 #### Nhóm Gốc — Classical Breadth
 | Chỉ báo | Mô tả |
@@ -38,29 +62,31 @@ Thay vì chỉ nhìn vào giá VN-Index, hệ thống này đo lường **"sức
 | `adl` | Advance-Decline Line — dòng tiền breadth tích lũy |
 | `mcclellan_osc` | McClellan Oscillator (Ratio-Adjusted) — momentum ngắn hạn |
 | `mcclellan_sum` | McClellan Summation Index — momentum trung hạn |
-| `new_highs / new_lows` | Số mã đạt đỉnh / đáy 52 tuần |
-| `net_new_highs_pct` | % Net New 52W Highs/Lows — chất lượng xu hướng |
+| `new_highs / new_lows` | Số mã đạt đỉnh / đáy trong cửa sổ `HIGH_LOW_WINDOW` phiên |
+| `net_new_highs_pct` | % Net New Highs/Lows — chất lượng xu hướng |
 
-#### Nhóm 1 — Momentum & Thrust *(mới)*
+> ⚠️ `HIGH_LOW_WINDOW = 126` (≈ 6 tháng), trong khi nhãn trên chart/Excel/Gemini vẫn ghi "52W". Đây là điểm chưa thống nhất, xem mục *Việc cần làm*.
+
+#### Nhóm 1 — Momentum & Thrust
 | Chỉ báo | Mô tả |
 |---|---|
 | `breadth_thrust` | Whaley Breadth Thrust — 10D EMA(Advances/Total), phát hiện bùng phát mạnh |
 | `pct_rising_3d` | % cổ phiếu tăng liên tiếp 3 ngày — đo đà tích cực liên tục |
 
-#### Nhóm 2 — Volume Breadth / TRIN *(mới)*
+#### Nhóm 2 — Volume Breadth / TRIN
 | Chỉ báo | Mô tả |
 |---|---|
 | `upvol_ratio` | AdvVol / TotalVol × 100 — % khối lượng chảy vào cổ phiếu tăng |
 | `adv_vol / dec_vol` | Tổng khối lượng của cổ phiếu tăng / giảm giá |
 | `trin` | Arms Index (TRIN) = (Adv/Dec) / (AdvVol/DecVol) — TRIN < 1 = Bullish |
 
-#### Nhóm 3 — Cumulative Breadth *(mới)*
+#### Nhóm 3 — Cumulative Breadth
 | Chỉ báo | Mô tả |
 |---|---|
 | `high_low_line` | Cumsum(NewHighs − NewLows) — xác nhận xu hướng dài hạn |
 | `adv_vol_line` | Cumsum(AdvVol − DecVol) — xác nhận ADL bằng dòng tiền volume |
 
-#### Nhóm 4 — Regime Detection & Composite Score *(mới)*
+#### Nhóm 4 — Regime Detection & Composite Score
 | Chỉ báo | Mô tả |
 |---|---|
 | `adl_slope` | Tốc độ thay đổi ADL chuẩn hóa (20D) — dương = breadth cải thiện |
@@ -83,7 +109,7 @@ Thay vì chỉ nhìn vào giá VN-Index, hệ thống này đo lường **"sức
 ```
 
 ### 🤖 AI-Powered Analysis
-- **Gemini Vision** đọc chart PNG + dữ liệu số → sinh báo cáo phân tích tiếng Việt (< 350 từ)
+- **Gemini** nhận bộ số liệu breadth dạng text (không upload ảnh) → sinh báo cáo phân tích tiếng Việt (< 350 từ)
 - Phân tích 7 chỉ báo cốt lõi, nhận định ngắn hạn/dài hạn, rủi ro divergence, khuyến nghị vị thế
 
 ### 📱 Telegram Daily Report
@@ -91,10 +117,10 @@ Thay vì chỉ nhìn vào giá VN-Index, hệ thống này đo lường **"sức
 - Header hiển thị Composite Score và Market Regime hiện tại
 
 ### 📁 Excel Export (6 sheets)
-- `breadth_data` — toàn bộ dữ liệu số (15+ cột)
-- `chart_ma` — biểu đồ % above MA + VN-Index
+- `breadth_data` — toàn bộ dữ liệu số (24 cột)
+- `chart_ma` — % above MA + VN-Index
 - `chart_adl` — ADL + High-Low Line + McClellan Oscillator
-- `chart_hl` — Net New 52W Highs/Lows
+- `chart_hl` — Net New Highs/Lows
 - `chart_volume` — UpVol Ratio + TRIN
 - `chart_composite` — Composite Score + Breadth Thrust
 
@@ -110,17 +136,29 @@ VN_Index_market_breadth_composite/
 ├── breadth_composite/
 │   ├── __init__.py                # Public API exports
 │   ├── config.py                  # Tất cả tham số cấu hình (không hardcode)
-│   ├── data_loader.py             # Fetch OHLCV từ vnstock v4 + Parquet cache
-│   ├── breadth_calc.py            # Engine tính toán 15+ chỉ báo breadth
+│   ├── yuanta_api.py              # HTTP client: price board + history, challenge, lịch giao dịch
+│   ├── data_loader.py             # Universe, fetch incremental, phát hiện điều chỉnh, Parquet cache
+│   ├── breadth_calc.py            # Engine tính toán 24 chỉ báo breadth
 │   ├── chart_render.py            # Render PNG dashboard 3×2
 │   ├── export.py                  # Export Excel 6 sheets
 │   └── notify.py                  # Gemini AI analysis + Telegram sender
 │
-├── .github/
-│   └── workflows/
-│       └── breadth_daily.yml      # GitHub Actions — chạy tự động hàng ngày
+├── tests/                         # pytest — toàn bộ chạy offline với HTTP giả lập
+│   ├── conftest.py                # FakeSession / FakeResponse / StubClient
+│   ├── test_yuanta_api.py         # Parse bar, lịch giao dịch, retry, challenge
+│   ├── test_data_loader.py        # Universe, incremental, điều chỉnh giá, cache
+│   ├── test_notify.py             # getMe/getChat, gửi text/ảnh, chunking, fallback
+│   └── test_pipeline_smoke.py     # compute → Excel/PNG + kiểm tra repo sạch SDK
 │
+├── tools/
+│   ├── notify_test.py             # Kiểm tra Telegram: --check / --send / --sample-report / --failure
+│   └── probe_yuanta.py            # Chẩn đoán endpoint dữ liệu thị trường
+│
+├── .github/workflows/breadth_daily.yml   # Pipeline hằng ngày
+├── .github/workflows/diagnostics.yml     # Kiểm tra Telegram / API theo yêu cầu
 ├── requirements.txt
+├── requirements-dev.txt
+├── pytest.ini
 └── README.md
 ```
 
@@ -138,133 +176,183 @@ cd VN_Index_market_breadth_composite
 ### 2. Cài đặt môi trường
 
 ```bash
-# Tạo virtual environment (khuyến nghị)
 python -m venv .venv
 .venv\Scripts\activate        # Windows
 # source .venv/bin/activate   # Linux/macOS
 
-# Cài dependencies
-pip install -r requirements.txt
+pip install -r requirements.txt       # chạy pipeline
+pip install -r requirements-dev.txt   # nếu muốn chạy test
 ```
 
-### 3. Cấu hình secrets
+Không cần API key để lấy dữ liệu thị trường: endpoint price board / history không yêu cầu key, quyền truy cập gắn với mạng của tài khoản đã mua.
 
-Tạo file `.env` trong thư mục gốc (đã có trong `.gitignore` — **không bao giờ commit file này**):
+### 3. Cấu hình secrets (chỉ cho báo cáo)
+
+Tạo file `.env` ở thư mục gốc (đã gitignore — **không commit**):
 
 ```env
-# .env — KHÔNG commit file này lên GitHub!
-VNSTOCK_API_KEY=your_vnstock_api_key_here
 GEMINI_API_KEY=your_gemini_api_key_here
 TELEGRAM_TOKEN=your_telegram_bot_token_here
 TELEGRAM_ID=your_telegram_chat_id_here
 ```
 
-Để load `.env` khi chạy local, thêm vào đầu `main.py` hoặc dùng `python-dotenv`:
-
-```bash
-pip install python-dotenv
-```
-
-```python
-# Đầu main.py (chỉ dùng local)
-from dotenv import load_dotenv
-load_dotenv()
-```
+File `.env` không tự được load: khi chạy local hãy `export` biến môi trường, hoặc dùng `python-dotenv` như README cũ. Trong GitHub Actions các giá trị này đến từ Secrets.
 
 ### 4. Chạy pipeline
 
 ```bash
-# Chạy bình thường (incremental — chỉ fetch ngày mới)
+# Chạy bình thường (incremental — chỉ fetch phần thiếu)
 python main.py
 
 # Full re-fetch 6 năm (lần đầu hoặc khi cache hỏng)
 python main.py --full
 
-# Chỉ tính toán, không export/gửi (để test nhanh)
+# Chỉ tính toán, không ghi cache/Excel/PNG/Telegram
 python main.py --dry-run
+
+# Bỏ qua Gemini + Telegram (chỉ tạo Excel/PNG)
+python main.py --no-notify
+
+# Exit code 3 nếu không gửi được Telegram (workflow dùng cờ này)
+python main.py --strict-notify
 
 # Gửi email sau khi export
 python main.py --send-email
 ```
 
+### 5. Kiểm thử
+
+```bash
+python -m pytest          # 90 test, không cần mạng
+```
+
+Test dùng HTTP giả lập (`FakeSession`, `FakeTelegram`) nên chạy được cả khi mạng bị chặn: chúng kiểm tra parse bar, cutoff 15:15, lịch cuối tuần, retry/backoff, challenge redirect (cùng host), universe filter, backfill mã mới, phát hiện điều chỉnh giá, circuit breaker, cache round-trip, toàn bộ pipeline compute → Excel → PNG, và đường đi Telegram (getMe/getChat, gửi text/ảnh, chia chunk không vỡ thẻ HTML, fallback plain text, ảnh lỗi không làm mất text).
+
+### 6. Chẩn đoán endpoint thật
+
+```bash
+python tools/probe_yuanta.py --symbols VIC,ANV,VNM --json output/probe_yuanta.json
+```
+
+Script in ra: số index và có `VNINDEX` hay không, số mã + phân bố `SymbolType` theo sàn, `t` có đúng 00:00 UTC không, `first/last` date & close, tỷ lệ `RefP / close` để xác nhận đơn vị giá (nghìn VND), và số lần gặp challenge. Đây là cách xác nhận các giả định mà test offline không thể kiểm chứng.
+
+---
+
+## 📱 Kiểm tra Telegram (không cần chạy pipeline)
+
+Báo cáo chỉ có giá trị khi nó thực sự tới được Telegram. Có 4 chế độ kiểm tra, dùng cho cả local và Actions:
+
+| Lệnh | Việc nó làm | Khi nào dùng |
+|---|---|---|
+| `python tools/notify_test.py --check` | `getMe` + `getChat`, **không gửi tin** | Kiểm tra token/chat_id có đúng, bot có trong chat? |
+| `python tools/notify_test.py --send "text"` | Gửi 1 tin nhắn test | Xác nhận gửi thật thành công |
+| `python tools/notify_test.py --sample-report` | Dựng dữ liệu tổng hợp → PNG dashboard → `notify_daily` | Kiểm tra **toàn bộ** đường đi ảnh + text + Gemini mà không cần API thị trường |
+| `python tools/notify_test.py --failure --log output/pipeline.log` | Gửi cảnh báo ❌ + 30 dòng log cuối | Workflow gọi tự động khi pipeline fail |
+
+Trên GitHub chỉ cần: **Actions → Diagnostics → Run workflow → chọn `telegram_check`** (rồi `telegram_test_message`, rồi `sample_report`). Workflow này chạy test suite trước, in bảng secret đã set/thiếu (không in giá trị), và ghi cách đọc kết quả vào phần Summary của run.
+
+Lỗi thường gặp và cách đọc:
+
+| Thông báo Telegram | Nguyên nhân | Xử lý |
+|---|---|---|
+| `Unauthorized` | `TELEGRAM_TOKEN` sai/đã thu hồi | Lấy token mới từ @BotFather |
+| `Bad Request: chat not found` | `TELEGRAM_ID` sai, chưa `/start` bot, hoặc bot chưa được add vào group | Mở `https://api.telegram.org/bot<TOKEN>/getUpdates` sau khi nhắn bot, lấy `message.chat.id` (group thường là `-100xxxxxxxxxx`) |
+| `Forbidden: bot was blocked by the user` | Bạn đã block bot | Bỏ block trong Telegram |
+| `chat_id is empty` / thiếu secret | Secret chưa tạo ở repo | Settings → Secrets → Actions |
+
+Vì sao trước đây "không thấy tin nhắn mà run vẫn xanh": `notify_daily` nuốt lỗi và chỉ ghi log. Từ v3.0 hàm này trả về `NotifyResult` (`delivered`, `analysis_ok`, số ký tự), `main.py --strict-notify` exit **3** khi không gửi được, và workflow có step `Báo lỗi qua Telegram` chạy `if: failure()`. Kết quả: **mỗi run hoặc gửi báo cáo, hoặc gửi cảnh báo lỗi** — không còn im lặng.
+
 ---
 
 ## 🔄 Tự động hóa với GitHub Actions
 
-Pipeline được thiết kế để chạy hoàn toàn tự động trên GitHub Actions.
+Có hai workflow, tách theo mục đích:
+
+| Workflow | Chạy khi nào | Làm gì |
+|---|---|---|
+| **Breadth Composite Daily** | `workflow_dispatch` / `repository_dispatch` / cron (đang comment) | pytest → kiểm tra secret → `getMe/getChat` → pipeline → cache → artifact. Luôn kết thúc bằng một tin nhắn Telegram: báo cáo, hoặc cảnh báo lỗi kèm log tail |
+| **Diagnostics** | chỉ `workflow_dispatch` | Chọn 1 trong 4 việc: `telegram_check`, `telegram_test_message`, `sample_report`, `endpoint_probe` |
+
+Input của **Breadth Composite Daily**: `full_fetch` (mặc định `false`), `notify` (mặc định `true`), `send_email` (mặc định `false`). Với `notify = false` pipeline chạy `--no-notify` và không gửi gì.
 
 ### Cấu hình GitHub Secrets
 
-Vào **Settings → Secrets and variables → Actions** của repo, thêm:
+**Settings → Secrets and variables → Actions**:
 
 | Secret | Mô tả |
 |---|---|
-| `VNSTOCK_API_KEY` | API key vnstock để fetch dữ liệu HOSE |
 | `GEMINI_API_KEY` | Google Gemini API key cho AI analysis |
 | `TELEGRAM_TOKEN` | Telegram Bot Token |
 | `TELEGRAM_ID` | Telegram Chat ID nhận báo cáo |
 
+`GMAIL_USER` / `GMAIL_APP_PASSWORD` / `EMAIL_RECIPIENTS` chỉ cần nếu bật job email (hiện đang tắt).
+
 ### Kích hoạt pipeline
 
-**Cách 1: Trigger thủ công** từ GitHub UI → Actions → "Breadth Composite Daily" → "Run workflow"
+**Cách 1: Trigger thủ công** — Actions → "Breadth Composite Daily" → "Run workflow" (tuỳ chọn `full_fetch`, `notify`, `send_email`).
 
-**Cách 2: Bật lịch tự động** — bỏ comment dòng schedule trong `breadth_daily.yml`:
+**Cách 2: Bật lịch tự động** — bỏ comment trong `breadth_daily.yml`:
 
 ```yaml
-# .github/workflows/breadth_daily.yml
 on:
   schedule:
     - cron: "30 10 * * 1-5"   # 17:30 ICT (UTC+7), Thứ 2–Thứ 6
 ```
 
-**Cách 3: Repository Dispatch** — trigger từ script bên ngoài:
+**Cách 3: Repository Dispatch**
 
 ```bash
 curl -X POST \
   -H "Authorization: token YOUR_GITHUB_PAT" \
-  -H "Accept: application/vnd.github.v3+json" \
+  -H "Accept: application/vnd.github+json" \
   https://api.github.com/repos/FTU-kudo/VN_Index_market_breadth_composite/dispatches \
   -d '{"event_type":"run-breadth"}'
 ```
+
+### Cache OHLCV
+
+Parquet được lưu bằng `actions/cache` với **key riêng cho mỗi run** (`ohlcv-cache-<os>-<run_id>`) và `restore-keys: ohlcv-cache-<os>-`.
+
+Lý do: cache của Actions là **bất biến**. Nếu key cố định (ví dụ chỉ dựa vào hash của `config.py`), lần lưu thứ hai trở đi sẽ bị từ chối và mọi run sau đó đều khôi phục đúng một bản cache cũ — "incremental" biến thành "tải lại từ ngày đó mỗi lần".
 
 ---
 
 ## 📦 Output files
 
-Sau khi pipeline chạy xong, các file được tạo trong thư mục `output/` (không commit lên git):
-
 ```
 output/
-├── breadth_data_cache.parquet    # Cache OHLCV (Parquet, tái sử dụng)
+├── breadth_data_cache.parquet    # Cache OHLCV (Parquet, dùng lại giữa các run)
 ├── breadth_composite.xlsx        # Báo cáo Excel 6 sheets
-└── breadth_chart.png             # Dashboard PNG 3×2 panels
+├── breadth_chart.png             # Dashboard PNG 3×2 panels
+└── probe_yuanta.json             # (tuỳ chọn) kết quả chẩn đoán endpoint
 ```
 
-> **Lưu ý**: Thư mục `output/` được gitignore — dữ liệu không bao giờ bị commit lên repo.
+Thư mục `output/` nằm trong `.gitignore` — không commit dữ liệu lên git (cache đi qua GitHub Actions cache, báo cáo đi qua artifact/Telegram).
 
 ---
 
 ## 🔒 Bảo mật
 
-Dự án được thiết kế với nguyên tắc **zero secrets in code**:
-
-- ✅ **Không hardcode** bất kỳ API key, token nào trong source code
-- ✅ Tất cả credentials đọc hoàn toàn từ `os.environ` hoặc GitHub Secrets
-- ✅ File `.env`, `output/`, `*.parquet`, `*.xlsx` đều có trong `.gitignore`
-- ✅ `secrets.json` cũng được gitignore
+- ✅ Không hardcode API key, token trong source code
+- ✅ Credentials chỉ đọc từ `os.environ` / GitHub Secrets
+- ✅ `.env`, `output/`, `*.parquet`, `*.xlsx` đều có trong `.gitignore`
+- ✅ `requirements.txt` không còn `--extra-index-url` trỏ tới index bên thứ ba (tránh rủi ro dependency confusion); mọi thư viện đến từ PyPI
+- ✅ Báo cáo (PNG, Excel, Telegram, prompt Gemini) **không ghi tên nhà cung cấp dữ liệu** — test `test_no_provider_attribution_in_user_facing_modules` chặn việc vô tình thêm vào
+- ✅ Log và Summary chỉ in *độ dài* của secret, không in giá trị; thông báo lỗi của Telegram được in nguyên văn để dễ sửa cấu hình
 
 ---
 
 ## 🛠️ Dependencies
 
 ```
-vnstock>=4.0.0        # Dữ liệu thị trường Việt Nam (HOSE, HNX, UPCOM)
 pandas>=2.0.0         # Xử lý dữ liệu
 numpy>=1.24.0         # Tính toán số học vectorized
 pyarrow>=14.0.0       # Đọc/ghi Parquet cache
 XlsxWriter>=3.1.0     # Export Excel
 matplotlib>=3.7.0     # Render chart PNG
-requests>=2.31.0      # HTTP calls (Gemini API + Telegram API)
+requests>=2.31.0      # HTTP (price board, history, Gemini, Telegram)
+google-genai>=0.2.0   # Gemini SDK
+pytest>=7.4.0         # (dev) test suite
 ```
 
 ---
@@ -277,27 +365,26 @@ requests>=2.31.0      # HTTP calls (Gemini API + Telegram API)
 |---|---|---|
 | `pct_above_ma50` | 25% | 0–100% |
 | `pct_above_ma200` | 20% | 0–100% |
-| `adl_slope` (20D normalized) | 20% | -3 đến +3 σ |
-| `mcclellan_osc` | 15% | -150 đến +150 |
-| `net_new_highs_pct` | 10% | -50% đến +50% |
-| `upvol_ratio` | 10% | 0–100% (NaN nếu không có volume) |
+| `adl_slope` (20D normalized) | 20% | −3 đến +3 σ |
+| `mcclellan_osc` | 15% | −150 đến +150 |
+| `net_new_highs_pct` | 10% | −50% đến +50% |
+| `upvol_ratio` | 10% | 0–100% (bỏ qua nếu không có volume) |
 
 **Đọc kết quả:**
 - `> 70`: 🟢 **Bullish** — thị trường rộng và mạnh
 - `50–70`: 🟡 **Neutral/Cautious** — breadth trung bình
 - `< 30`: 🔴 **Bearish** — áp lực bán rộng khắp
-- `< 30`: 🔴 **Bearish** — áp lực bán rộng khắp
 
 **Regime Detection (rule-based):**
 - 🟢 `Bull (+1)`: `pct_above_ma200 ≥ 60%` VÀ `adl_slope > 0`
-- 🔴 `Bear (-1)`: `pct_above_ma200 ≤ 40%` VÀ `adl_slope < 0`
+- 🔴 `Bear (−1)`: `pct_above_ma200 ≤ 40%` VÀ `adl_slope < 0`
 - 🟡 `Transition (0)`: tất cả trường hợp còn lại
 
 ---
 
 ## 🤖 Gemini AI Analysis
 
-Mỗi ngày, Gemini Vision nhận chart PNG 3×2 + dữ liệu số và sinh báo cáo gồm:
+Mỗi ngày, Gemini nhận bộ số liệu breadth dạng text và sinh báo cáo gồm:
 
 - 🎯 **Regime & Composite**: Tóm tắt điểm số và trạng thái thị trường
 - 🔍 **Nhận định chung**: Gọi tên chính xác trạng thái cốt lõi
@@ -309,6 +396,15 @@ Mỗi ngày, Gemini Vision nhận chart PNG 3×2 + dữ liệu số và sinh bá
 
 ---
 
+## 📝 Việc cần làm (đã biết, chưa sửa)
+
+1. `HIGH_LOW_WINDOW = 126` nhưng nhãn "52W" xuất hiện trên chart, Excel và prompt Gemini → hoặc đổi thành 252, hoặc đổi nhãn thành "6M".
+2. Một số tham số trong `config.py` chưa được dùng ở đâu (`ADL_LOOKBACK_DAYS`, `REGIME_THRESHOLDS`, `EMAIL_SUBJECT_PREFIX`, `TRIN_MA_PERIOD`, `UPVOL_MA_PERIOD`); chart đang hardcode `rolling(10)` cho UpVol và không làm mượt TRIN.
+3. `GEMINI_MODEL` cần được xác nhận là model còn tồn tại; nếu sai, `notify.py` chỉ gửi "❌ Gemini lỗi" kèm số liệu thô.
+4. Chưa có lịch nghỉ lễ: ngày lễ không có bar mới nên pipeline tự dùng phiên trước, nhưng `latest_session_date()` không biết ngày lễ.
+
+---
+
 ## 📝 Giấy phép
 
 MIT License — Xem file [LICENSE](LICENSE) để biết thêm chi tiết.
@@ -317,10 +413,9 @@ MIT License — Xem file [LICENSE](LICENSE) để biết thêm chi tiết.
 
 ## 🙏 Tài nguyên & Cảm ơn
 
-- [vnstock](https://github.com/thinh-vu/vnstock) — Thư viện dữ liệu chứng khoán Việt Nam
 - [McClellan Financial Publications](https://www.mcoscillator.com/) — Lý thuyết McClellan Oscillator
 - [StockCharts — ChartSchool](https://school.stockcharts.com/doku.php?id=market_indicators) — Market Breadth Theory
-- Google Gemini AI — Phân tích chart bằng Vision API
+- Google Gemini AI — Phân tích báo cáo
 
 ---
 

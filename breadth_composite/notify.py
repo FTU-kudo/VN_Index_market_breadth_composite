@@ -1,20 +1,23 @@
+# breadth_composite/notify.py
 """
-notify.py — Gemini Text Analysis + Telegram Notification (v2.1)
+notify.py — Gemini text analysis + Telegram delivery (v3.0)
 
 Flow:
   1. Tổng hợp dữ liệu breadth thành text metrics
   2. Gửi TEXT-ONLY cho Gemini → nhận phân tích tiếng Việt
-  3. Gửi Telegram: ảnh PNG (để xem) + text phân tích của Gemini
+  3. Gửi Telegram: ảnh PNG (để xem) + text phân tích
 
-Lý do dùng text-only (không gửi ảnh lên Gemini):
-  - Ảnh PNG 3×2 @ 150dpi có thể > 10MB → 404 từ Gemini REST API
-  - Gemini đọc số liệu text cũng cho kết quả phân tích tốt
-  - Ảnh PNG vẫn được gửi qua Telegram để người dùng xem trực quan
+Điểm quan trọng của v3.0 (để "kiểm tra được" và không im lặng khi lỗi):
+  * `notify_daily()` trả về `NotifyResult` (delivered / analysis_ok / chars) thay vì None,
+    nên `main.py --strict-notify` có thể exit code 3 khi không gửi được.
+  * `telegram_check()` kiểm tra token + chat (getMe / getChat) **không** gửi tin nhắn,
+    dùng cho workflow Diagnostics.
+  * Ảnh lỗi (quá lớn, sai định dạng) chỉ là warning: text vẫn được gửi, vì text mới là báo cáo.
+  * Text được chia theo dòng trước khi convert HTML → không bao giờ cắt giữa thẻ `<b>`
+    (lỗi cũ: chia theo ký tự làm Telegram trả 400 rồi fallback toàn bộ sang plain text).
 
-Secrets cần trong GitHub Actions (đọc từ os.environ — KHÔNG hardcode):
-  GEMINI_API_KEY
-  TELEGRAM_TOKEN
-  TELEGRAM_ID
+Secrets (đọc từ os.environ — KHÔNG hardcode):
+  GEMINI_API_KEY, TELEGRAM_TOKEN, TELEGRAM_ID
 """
 
 from __future__ import annotations
@@ -22,9 +25,10 @@ from __future__ import annotations
 import logging
 import os
 import re
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -33,7 +37,13 @@ import requests
 logger = logging.getLogger(__name__)
 
 
-GEMINI_MODEL   = "gemini-3.5-flash-lite"
+GEMINI_MODEL = "gemini-3.5-flash-lite"
+
+TELEGRAM_API = "https://api.telegram.org"
+TELEGRAM_TEXT_LIMIT = 4000          # giới hạn thực tế của Telegram là 4096
+TELEGRAM_TIMEOUT = 30
+_TOKEN_RE = re.compile(r"^\d+:[A-Za-z0-9_-]{20,}$")
+
 _ANALYSIS_PROMPT = """
 Bạn là một chuyên gia phân tích thị trường chứng khoán Việt Nam (HOSE) với 10 năm kinh nghiệm, nổi tiếng với lối phân tích thực chiến, sắc bén và cô đọng.
 
@@ -72,6 +82,41 @@ Dùng emoji tăng tính scannable. Tập trung vào tính thực chiến cho nh�
 """
 
 
+# ---------------------------------------------------------------------------
+# Kết quả / lỗi cấu hình
+# ---------------------------------------------------------------------------
+
+class NotifyConfigError(RuntimeError):
+    """Thiếu secret, token sai định dạng, hoặc Telegram từ chối (getMe/getChat/send)."""
+
+
+@dataclass
+class NotifyResult:
+    """Kết quả một lần gửi báo cáo — dùng được cho log, CLI và exit code."""
+
+    delivered: bool = False
+    analysis_ok: bool = False
+    analysis_chars: int = 0
+    text_chars: int = 0
+    photo_sent: bool = False
+    error: str = ""
+
+    def summary(self) -> str:
+        parts = [
+            f"delivered={'yes' if self.delivered else 'NO'}",
+            f"gemini={'ok' if self.analysis_ok else 'failed'}",
+            f"text={self.text_chars} chars",
+            f"photo={'yes' if self.photo_sent else 'no'}",
+        ]
+        if self.error:
+            parts.append(f"error={self.error}")
+        return " | ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Gemini analysis
+# ---------------------------------------------------------------------------
+
 def _build_metrics_text(breadth: pd.DataFrame) -> str:
     """Trích xuất dòng dữ liệu cuối cùng thành text để Gemini đọc."""
     if breadth.empty:
@@ -85,7 +130,6 @@ def _build_metrics_text(breadth: pd.DataFrame) -> str:
             return "N/A"
         return f"{v:{fmt}}"
 
-    # Xác định trạng thái regime
     regime_val = last.get("regime")
     if regime_val is None or (isinstance(regime_val, float) and np.isnan(regime_val)):
         regime_label = "N/A"
@@ -134,217 +178,327 @@ def _build_metrics_text(breadth: pd.DataFrame) -> str:
     return "\n".join(lines)
 
 
-def analyse_with_gemini(
-    breadth: pd.DataFrame,
-) -> str:
+def analysis_failed(analysis: str) -> bool:
+    """True khi Gemini không trả về phân tích (text fallback bắt đầu bằng ❌)."""
+    return not analysis or analysis.lstrip().startswith("❌")
+
+
+def analyse_with_gemini(breadth: pd.DataFrame) -> str:
     """
     Gửi TEXT-ONLY (các chỉ số breadth) đến Gemini, nhận về phân tích tiếng Việt.
-    Không gửi ảnh — tránh lỗi 404 do payload quá lớn.
-    API key đọc hoàn toàn từ os.environ — không bao giờ hardcode.
+    Không gửi ảnh. API key đọc hoàn toàn từ os.environ.
 
-    Returns
-    -------
-    str  — nội dung phân tích, hoặc fallback text nếu lỗi
+    Returns: nội dung phân tích, hoặc text fallback (bắt đầu bằng ❌) nếu lỗi.
     """
+    today_str = date.today().strftime("%d/%m/%Y")
+    metrics_text = _build_metrics_text(breadth)
+
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
         logger.error("GEMINI_API_KEY not set — kiểm tra GitHub Secrets hoặc file .env")
-        return "❌ Không thể phân tích: thiếu GEMINI_API_KEY."
-
-    today_str    = date.today().strftime("%d/%m/%Y")
-    metrics_text = _build_metrics_text(breadth)
-    prompt_text  = _ANALYSIS_PROMPT.format(
-        today=today_str,
-        metrics_text=metrics_text,
-    )
+        # Vẫn gửi số liệu thô: thiếu AI không có nghĩa là không có báo cáo.
+        return f"❌ Không thể phân tích: thiếu GEMINI_API_KEY.\n\n📊 Dữ liệu thô:\n{metrics_text}"
+    prompt_text = _ANALYSIS_PROMPT.format(today=today_str, metrics_text=metrics_text)
 
     try:
         from google import genai
         from google.genai import types
-        
+
         client = genai.Client(api_key=api_key)
-        
         response = client.models.generate_content(
             model=GEMINI_MODEL,
             contents=prompt_text,
             config=types.GenerateContentConfig(
                 temperature=0.3,
                 max_output_tokens=1200,
-            )
+            ),
         )
-        
-        analysis = response.text
-        logger.info("Gemini analysis received (%d chars)", len(analysis))
-        return analysis.strip()
+        analysis = (response.text or "").strip()
+        if not analysis:
+            raise RuntimeError("Gemini trả về nội dung rỗng")
+        logger.info("Gemini analysis received (%d chars, model=%s)", len(analysis), GEMINI_MODEL)
+        return analysis
 
     except ImportError:
-        logger.error("Missing google-genai library. Please pip install google-genai>=0.2.0")
+        logger.error("Missing google-genai library. pip install google-genai>=0.2.0")
         return f"❌ Gemini lỗi: Thiếu thư viện google-genai\n\n📊 Dữ liệu thô:\n{metrics_text}"
     except Exception as exc:
-        logger.error("Gemini SDK error: %s", exc)
+        logger.error("Gemini SDK error (model=%s): %s", GEMINI_MODEL, exc)
         return f"❌ Gemini lỗi: {exc}\n\n📊 Dữ liệu thô:\n{metrics_text}"
 
 
 # ---------------------------------------------------------------------------
-# Telegram
+# Telegram: cấu hình & kiểm tra
 # ---------------------------------------------------------------------------
 
-def send_telegram(
-    text: str,
-    image_path: Optional[str] = None,
-) -> bool:
-    """
-    Gửi ảnh + text phân tích qua Telegram.
-    Token và chat_id đọc hoàn toàn từ os.environ — không bao giờ hardcode.
-    """
-    token   = os.environ.get("TELEGRAM_TOKEN", "").strip()
+def telegram_credentials() -> Tuple[str, str]:
+    """(token, chat_id) từ env, kèm kiểm tra định dạng cơ bản. Raise NotifyConfigError."""
+    token = os.environ.get("TELEGRAM_TOKEN", "").strip()
     chat_id = os.environ.get("TELEGRAM_ID", "").strip()
 
-    if not token or not chat_id:
-        logger.error(
-            "TELEGRAM_TOKEN hoặc TELEGRAM_ID không được set — "
-            "kiểm tra GitHub Secrets hoặc file .env"
+    missing = [name for name, value in (("TELEGRAM_TOKEN", token), ("TELEGRAM_ID", chat_id)) if not value]
+    if missing:
+        raise NotifyConfigError(
+            "Thiếu secret: " + ", ".join(missing)
+            + " — thêm vào Settings → Secrets and variables → Actions"
         )
-        return False
 
-    base_url = f"https://api.telegram.org/bot{token}"
-    success  = True
+    if not _TOKEN_RE.match(token):
+        raise NotifyConfigError(
+            "TELEGRAM_TOKEN không đúng định dạng '<bot_id>:<hash>' — "
+            "copy lại token từ @BotFather (đừng dán username hay URL)"
+        )
+    return token, chat_id
 
-    # Message 1: ảnh chart PNG (để user xem trực quan)
-    if image_path and Path(image_path).exists():
-        try:
-            with open(image_path, "rb") as img:
-                resp = requests.post(
-                    f"{base_url}/sendPhoto",
-                    data={"chat_id": chat_id},
-                    files={"photo": img},
-                    timeout=30,
-                )
-            resp.raise_for_status()
-            logger.info("Telegram: sendPhoto OK")
-        except Exception as exc:
-            logger.warning("Telegram sendPhoto failed: %s", exc)
-            success = False
 
-    # Message 2: text phân tích từ Gemini
-    if not _send_text_message(base_url, chat_id, text):
-        success = False
+def _api_call(
+    method: str,
+    *,
+    token: str,
+    payload: Optional[Dict[str, Any]] = None,
+    files: Optional[Dict[str, Any]] = None,
+    timeout: int = TELEGRAM_TIMEOUT,
+) -> Dict[str, Any]:
+    """
+    Gọi một Telegram Bot API method và trả `result`.
+    Lỗi mạng / HTTP / `ok: false` đều thành NotifyConfigError với mô tả gốc của Telegram.
+    """
+    url = f"{TELEGRAM_API}/bot{token}/{method}"
+    try:
+        if files is not None:
+            response = requests.post(url, data=payload or {}, files=files, timeout=timeout)
+        elif payload is not None:
+            response = requests.post(url, json=payload, timeout=timeout)
+        else:
+            response = requests.get(url, timeout=timeout)
+    except Exception as exc:                      # transport, DNS, timeout…
+        raise NotifyConfigError(
+            f"{method}: không kết nối được tới api.telegram.org ({type(exc).__name__}: {exc})"
+        ) from exc
 
-    return success
+    status = int(getattr(response, "status_code", 0) or 0)
+    try:
+        body = response.json()
+    except Exception as exc:
+        raise NotifyConfigError(
+            f"{method}: HTTP {status}, phản hồi không phải JSON"
+        ) from exc
 
+    if not isinstance(body, dict) or not body.get("ok"):
+        description = ""
+        if isinstance(body, dict):
+            description = str(body.get("description") or "")
+        raise NotifyConfigError(f"{method}: HTTP {status} — {description or 'Telegram từ chối (ok=false)'}")
+
+    return body.get("result") or {}
+
+
+def telegram_check(timeout: int = 15) -> Dict[str, Any]:
+    """
+    Kiểm tra token + chat **không gửi tin nhắn nào**.
+
+    Trả về: {'bot_username', 'bot_id', 'chat_id', 'chat_title', 'chat_type'}
+    Raise NotifyConfigError với mô tả cụ thể (sai token / chat không tồn tại / bot chưa
+    được add vào group).
+    """
+    token, chat_id = telegram_credentials()
+
+    me = _api_call("getMe", token=token, timeout=timeout)
+    chat = _api_call("getChat", token=token, payload={"chat_id": chat_id}, timeout=timeout)
+
+    info = {
+        "bot_username": me.get("username") or "",
+        "bot_id": me.get("id"),
+        "chat_id": chat.get("id"),
+        "chat_title": chat.get("title") or chat.get("username") or chat.get("first_name") or "",
+        "chat_type": chat.get("type") or "",
+    }
+    logger.info(
+        "Telegram OK: bot=@%s | chat=%s (%s, id=%s)",
+        info["bot_username"], info["chat_title"], info["chat_type"], info["chat_id"],
+    )
+    return info
+
+
+# ---------------------------------------------------------------------------
+# Telegram: gửi tin nhắn
+# ---------------------------------------------------------------------------
 
 def _text_to_html(text: str) -> str:
-    """Convert '**bold**' sang '<b>bold</b>' và escape HTML special chars."""
-    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text, flags=re.DOTALL)
-    return text
+    """Escape HTML đặc biệt rồi đổi '**bold**' sang '<b>bold</b>'."""
+    escaped = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escaped, flags=re.DOTALL)
 
 
-def _send_text_message(base_url: str, chat_id: str, text: str) -> bool:
-    """Gửi message với HTML parse mode. Fallback về plain text nếu lỗi."""
-    MAX_LEN = 4000
-    success  = True
+def _chunk_text(text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> List[str]:
+    """
+    Chia text theo ranh giới dòng để mỗi chunk ≤ limit ký tự.
+    Chia theo dòng (không theo ký tự) để `**bold**` không bị cắt đôi — lỗi cũ làm
+    Telegram trả 400 "can't parse entities" và cả báo cáo rơi về plain text.
+    """
+    chunks: List[str] = []
+    current = ""
 
-    html_text = _text_to_html(text)
-    chunks = [html_text[i: i + MAX_LEN] for i in range(0, len(html_text), MAX_LEN)]
+    for line in text.splitlines(keepends=True):
+        while len(line) > limit:                 # một dòng dài bất thường
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+        if len(current) + len(line) > limit:
+            chunks.append(current)
+            current = line
+        else:
+            current += line
 
-    for chunk in chunks:
+    if current:
+        chunks.append(current)
+    return [c for c in chunks if c.strip()]
+
+
+def _send_text_message(token: str, chat_id: str, text: str) -> bool:
+    """Gửi text (chia chunk). Mỗi chunk thử HTML, nếu bị từ chối thì gửi plain text."""
+    chunks = _chunk_text(text)
+    all_ok = True
+
+    for index, chunk in enumerate(chunks, start=1):
         try:
-            resp = requests.post(
-                f"{base_url}/sendMessage",
-                json={
-                    "chat_id": chat_id,
-                    "text": chunk,
-                    "parse_mode": "HTML",
-                },
-                timeout=30,
+            _api_call(
+                "sendMessage",
+                token=token,
+                payload={"chat_id": chat_id, "text": _text_to_html(chunk), "parse_mode": "HTML"},
             )
-            resp.raise_for_status()
-            logger.info("HTML sent (%d chars)", len(chunk))
-        except Exception as exc:
-            response_text = ""
-            if hasattr(exc, "response") and exc.response is not None:
-                try:
-                    response_text = exc.response.text
-                except Exception:
-                    response_text = "Could not read response"
-            logger.error(
-                "HTML parse failed: %s\nResponse body: %s", exc, response_text
+            logger.info("Telegram text chunk %d/%d sent (%d chars, HTML)", index, len(chunks), len(chunk))
+            continue
+        except NotifyConfigError as exc:
+            logger.warning("HTML gửi lỗi ở chunk %d/%d (%s) — thử lại dạng plain text",
+                           index, len(chunks), exc)
+
+        try:
+            _api_call(
+                "sendMessage",
+                token=token,
+                payload={"chat_id": chat_id, "text": chunk.replace("**", "")},
             )
+            logger.info("Telegram text chunk %d/%d sent (%d chars, plain)", index, len(chunks), len(chunk))
+        except NotifyConfigError as exc:
+            logger.error("Không gửi được chunk %d/%d: %s", index, len(chunks), exc)
+            all_ok = False
 
-            # Fallback: plain text
-            logger.info("Falling back to plain text…")
-            plain_text   = text.replace("**", "")
-            plain_chunks = [plain_text[i: i + 4000]
-                            for i in range(0, len(plain_text), 4000)]
-            for plain in plain_chunks:
-                try:
-                    resp = requests.post(
-                        f"{base_url}/sendMessage",
-                        json={"chat_id": chat_id, "text": plain},
-                        timeout=30,
-                    )
-                    resp.raise_for_status()
-                    logger.info("Plain text sent (%d chars)", len(plain))
-                except Exception as fallback_exc:
-                    logger.error("Plain text fallback also failed: %s", fallback_exc)
-                    success = False
-            break
+    return all_ok
 
-    return success
+
+def send_telegram(text: str, image_path: Optional[str] = None) -> NotifyResult:
+    """
+    Gửi ảnh (nếu có) + text qua Telegram.
+
+    Ảnh lỗi KHÔNG làm fail cả lần gửi: text mới là báo cáo. Lỗi text mới là thất bại.
+    """
+    result = NotifyResult(text_chars=len(text or ""))
+
+    try:
+        token, chat_id = telegram_credentials()
+    except NotifyConfigError as exc:
+        logger.error("Telegram: %s", exc)
+        result.error = str(exc)
+        return result
+
+    if image_path and Path(image_path).exists():
+        try:
+            with open(image_path, "rb") as image:
+                _api_call(
+                    "sendPhoto",
+                    token=token,
+                    payload={"chat_id": chat_id},
+                    files={"photo": image},
+                )
+            result.photo_sent = True
+            logger.info("Telegram: sendPhoto OK (%s)", Path(image_path).name)
+        except NotifyConfigError as exc:
+            logger.warning("Telegram sendPhoto thất bại — vẫn gửi phần text: %s", exc)
+    elif image_path:
+        logger.warning("Không thấy file ảnh %s — chỉ gửi text", image_path)
+
+    result.delivered = _send_text_message(token, chat_id, text)
+    if not result.delivered:
+        result.error = result.error or "sendMessage thất bại (xem log phía trên)"
+    return result
+
+
+def send_text(text: str) -> NotifyResult:
+    """Gửi một tin nhắn text duy nhất (dùng cho kiểm tra / cảnh báo lỗi)."""
+    return send_telegram(text, image_path=None)
 
 
 # ---------------------------------------------------------------------------
 # Master notify function — gọi từ main.py
 # ---------------------------------------------------------------------------
 
-def notify_daily(
-    breadth: pd.DataFrame,
-    chart_png_path: str,
-) -> None:
-    """
-    Hàm duy nhất được gọi từ main.py:
-      1. Gemini phân tích TEXT chỉ số breadth (không gửi ảnh lên Gemini)
-      2. Telegram: gửi ảnh PNG (để xem) + text phân tích Gemini
-
-    Ảnh PNG vẫn được gửi qua Telegram — chỉ là Gemini không đọc ảnh nữa.
-    Lỗi được log nhưng không raise để không crash pipeline chính.
-    """
+def build_header(breadth: pd.DataFrame) -> str:
+    """Header báo cáo: ngày + Composite Score + Regime."""
     today_str = date.today().strftime("%d/%m/%Y")
-    logger.info("=== Gemini text analysis (v2.1 — text-only, no image upload) ===")
-
-    try:
-        analysis = analyse_with_gemini(breadth)
-    except Exception as exc:
-        logger.error("analyse_with_gemini crashed: %s", exc)
-        analysis = f"❌ Lỗi phân tích Gemini: {exc}"
-
-    # Header với Composite Score và Regime
     composite_str = ""
-    regime_str    = ""
+    regime_str = ""
+
     if not breadth.empty:
         last = breadth.dropna(how="all").iloc[-1]
-        cs   = last.get("composite_score")
-        rg   = last.get("regime")
-        if cs is not None and not (isinstance(cs, float) and np.isnan(cs)):
-            composite_str = f" | Score: {cs:.0f}/100"
-        if rg is not None and not (isinstance(rg, float) and np.isnan(rg)):
+        score = last.get("composite_score")
+        regime = last.get("regime")
+        if score is not None and not (isinstance(score, float) and np.isnan(score)):
+            composite_str = f" | Score: {score:.0f}/100"
+        if regime is not None and not (isinstance(regime, float) and np.isnan(regime)):
             regime_icons = {1: "🟢 Bull", 0: "🟡 Transition", -1: "🔴 Bear"}
-            regime_str = f" | {regime_icons.get(int(rg), '')}"
+            regime_str = f" | {regime_icons.get(int(regime), '')}"
 
-    header = (
-        f"📈 **VN-Index Breadth Report v2.1**\n"
+    return (
+        f"📈 **VN-Index Breadth Report v3.0**\n"
         f"📅 {today_str}{composite_str}{regime_str}\n"
         f"{'─' * 34}\n\n"
     )
-    full_message = header + analysis
+
+
+def notify_daily(
+    breadth: pd.DataFrame,
+    chart_png_path: Optional[str] = None,
+    header_prefix: str = "",
+) -> NotifyResult:
+    """
+    Phân tích bằng Gemini rồi gửi Telegram (ảnh + text).
+    Không raise: lỗi được ghi log và phản ánh trong `NotifyResult`.
+    """
+    logger.info("=== Gemini text analysis (text-only, no image upload) ===")
+
+    try:
+        analysis = analyse_with_gemini(breadth)
+    except Exception as exc:                      # defensive: analyse_with_gemini đã tự bắt
+        logger.error("analyse_with_gemini crashed: %s", exc)
+        analysis = f"❌ Lỗi phân tích Gemini: {exc}"
+
+    result = NotifyResult(
+        analysis_ok=not analysis_failed(analysis),
+        analysis_chars=len(analysis),
+    )
+    if not result.analysis_ok:
+        logger.warning("Gemini không trả về phân tích — báo cáo sẽ gồm số liệu thô")
+
+    message = header_prefix + build_header(breadth) + analysis
+    result.text_chars = len(message)
 
     logger.info("=== Send Telegram ===")
     try:
-        ok = send_telegram(full_message, image_path=chart_png_path)
-        if ok:
-            logger.info("Telegram notification sent successfully")
-        else:
-            logger.error("Telegram send returned False")
-    except Exception as exc:
+        sent = send_telegram(message, image_path=chart_png_path)
+    except Exception as exc:                      # defensive: send_telegram đã tự bắt
         logger.error("send_telegram crashed: %s", exc)
+        result.error = str(exc)
+        return result
+
+    result.delivered = sent.delivered
+    result.photo_sent = sent.photo_sent
+    result.error = sent.error
+
+    if result.delivered:
+        logger.info("Telegram notification sent (%s)", result.summary())
+    else:
+        logger.error("Telegram notification FAILED (%s)", result.summary())
+    return result

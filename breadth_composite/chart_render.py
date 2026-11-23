@@ -1,3 +1,4 @@
+# breadth_composite/chart_render.py
 """
 chart_render.py — Render breadth indicators ra PNG để Gemini Vision đọc.
 
@@ -25,7 +26,8 @@ import matplotlib.ticker as mticker
 import numpy as np
 import pandas as pd
 
-from .config import CHART_DISPLAY_YEARS, OUTPUT_DIR
+from . import config as _config
+from .config import CHART_DISPLAY_YEARS
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +60,8 @@ def render_breadth_chart(
     output_path: Optional[str] = None,
     display_years: int = CHART_DISPLAY_YEARS,
 ) -> str:
-    out = Path(output_path or f"{OUTPUT_DIR}/{CHART_PNG_FILENAME}")
+    # Read config at call time: --output-dir patches config after import.
+    out = Path(output_path or (Path(_config.OUTPUT_DIR) / CHART_PNG_FILENAME))
     out.parent.mkdir(parents=True, exist_ok=True)
 
     cutoff = pd.Timestamp(
@@ -467,9 +470,6 @@ def _plot_composite_score(ax: plt.Axes, df: pd.DataFrame) -> None:
 
     # --- Đường Composite Score ---
     # Tô màu gradient dựa trên mức điểm
-    score_vals = score.fillna(50)
-    line_colors = np.where(score_vals.values >= 60, C_TEAL,
-                           np.where(score_vals.values <= 40, C_RED, C_GOLD))
     ax.plot(dates, score, color=C_GOLD, lw=2.0, zorder=4, label="Composite Score")
 
     # 21D MA để làm mượt
