@@ -147,12 +147,15 @@ VN_Index_market_breadth_composite/
 │   ├── conftest.py                # FakeSession / FakeResponse / StubClient
 │   ├── test_yuanta_api.py         # Parse bar, lịch giao dịch, retry, challenge
 │   ├── test_data_loader.py        # Universe, incremental, điều chỉnh giá, cache
+│   ├── test_notify.py             # getMe/getChat, gửi text/ảnh, chunking, fallback
 │   └── test_pipeline_smoke.py     # compute → Excel/PNG + kiểm tra repo sạch SDK
 │
 ├── tools/
-│   └── probe_yuanta.py            # Chẩn đoán endpoint thật (chạy trong Actions)
+│   ├── notify_test.py             # Kiểm tra Telegram: --check / --send / --sample-report / --failure
+│   └── probe_yuanta.py            # Chẩn đoán endpoint dữ liệu thị trường
 │
-├── .github/workflows/breadth_daily.yml
+├── .github/workflows/breadth_daily.yml   # Pipeline hằng ngày
+├── .github/workflows/diagnostics.yml     # Kiểm tra Telegram / API theo yêu cầu
 ├── requirements.txt
 ├── requirements-dev.txt
 ├── pytest.ini
@@ -207,6 +210,12 @@ python main.py --full
 # Chỉ tính toán, không ghi cache/Excel/PNG/Telegram
 python main.py --dry-run
 
+# Bỏ qua Gemini + Telegram (chỉ tạo Excel/PNG)
+python main.py --no-notify
+
+# Exit code 3 nếu không gửi được Telegram (workflow dùng cờ này)
+python main.py --strict-notify
+
 # Gửi email sau khi export
 python main.py --send-email
 ```
@@ -214,10 +223,10 @@ python main.py --send-email
 ### 5. Kiểm thử
 
 ```bash
-python -m pytest          # 64 test, không cần mạng
+python -m pytest          # 90 test, không cần mạng
 ```
 
-Test dùng HTTP giả lập (`FakeSession`) nên chạy được cả khi mạng bị chặn: chúng kiểm tra parse bar, cutoff 15:15, lịch cuối tuần, retry/backoff, challenge redirect (cùng host), universe filter, backfill mã mới, phát hiện điều chỉnh giá, circuit breaker, cache round-trip, và toàn bộ pipeline compute → Excel → PNG trên dữ liệu tổng hợp.
+Test dùng HTTP giả lập (`FakeSession`, `FakeTelegram`) nên chạy được cả khi mạng bị chặn: chúng kiểm tra parse bar, cutoff 15:15, lịch cuối tuần, retry/backoff, challenge redirect (cùng host), universe filter, backfill mã mới, phát hiện điều chỉnh giá, circuit breaker, cache round-trip, toàn bộ pipeline compute → Excel → PNG, và đường đi Telegram (getMe/getChat, gửi text/ảnh, chia chunk không vỡ thẻ HTML, fallback plain text, ảnh lỗi không làm mất text).
 
 ### 6. Chẩn đoán endpoint thật
 
@@ -229,9 +238,42 @@ Script in ra: số index và có `VNINDEX` hay không, số mã + phân bố `Sy
 
 ---
 
+## 📱 Kiểm tra Telegram (không cần chạy pipeline)
+
+Báo cáo chỉ có giá trị khi nó thực sự tới được Telegram. Có 4 chế độ kiểm tra, dùng cho cả local và Actions:
+
+| Lệnh | Việc nó làm | Khi nào dùng |
+|---|---|---|
+| `python tools/notify_test.py --check` | `getMe` + `getChat`, **không gửi tin** | Kiểm tra token/chat_id có đúng, bot có trong chat? |
+| `python tools/notify_test.py --send "text"` | Gửi 1 tin nhắn test | Xác nhận gửi thật thành công |
+| `python tools/notify_test.py --sample-report` | Dựng dữ liệu tổng hợp → PNG dashboard → `notify_daily` | Kiểm tra **toàn bộ** đường đi ảnh + text + Gemini mà không cần API thị trường |
+| `python tools/notify_test.py --failure --log output/pipeline.log` | Gửi cảnh báo ❌ + 30 dòng log cuối | Workflow gọi tự động khi pipeline fail |
+
+Trên GitHub chỉ cần: **Actions → Diagnostics → Run workflow → chọn `telegram_check`** (rồi `telegram_test_message`, rồi `sample_report`). Workflow này chạy test suite trước, in bảng secret đã set/thiếu (không in giá trị), và ghi cách đọc kết quả vào phần Summary của run.
+
+Lỗi thường gặp và cách đọc:
+
+| Thông báo Telegram | Nguyên nhân | Xử lý |
+|---|---|---|
+| `Unauthorized` | `TELEGRAM_TOKEN` sai/đã thu hồi | Lấy token mới từ @BotFather |
+| `Bad Request: chat not found` | `TELEGRAM_ID` sai, chưa `/start` bot, hoặc bot chưa được add vào group | Mở `https://api.telegram.org/bot<TOKEN>/getUpdates` sau khi nhắn bot, lấy `message.chat.id` (group thường là `-100xxxxxxxxxx`) |
+| `Forbidden: bot was blocked by the user` | Bạn đã block bot | Bỏ block trong Telegram |
+| `chat_id is empty` / thiếu secret | Secret chưa tạo ở repo | Settings → Secrets → Actions |
+
+Vì sao trước đây "không thấy tin nhắn mà run vẫn xanh": `notify_daily` nuốt lỗi và chỉ ghi log. Từ v3.0 hàm này trả về `NotifyResult` (`delivered`, `analysis_ok`, số ký tự), `main.py --strict-notify` exit **3** khi không gửi được, và workflow có step `Báo lỗi qua Telegram` chạy `if: failure()`. Kết quả: **mỗi run hoặc gửi báo cáo, hoặc gửi cảnh báo lỗi** — không còn im lặng.
+
+---
+
 ## 🔄 Tự động hóa với GitHub Actions
 
-Workflow `.github/workflows/breadth_daily.yml` chạy: **cài đặt → pytest → pipeline → lưu cache → upload artifact**.
+Có hai workflow, tách theo mục đích:
+
+| Workflow | Chạy khi nào | Làm gì |
+|---|---|---|
+| **Breadth Composite Daily** | `workflow_dispatch` / `repository_dispatch` / cron (đang comment) | pytest → kiểm tra secret → `getMe/getChat` → pipeline → cache → artifact. Luôn kết thúc bằng một tin nhắn Telegram: báo cáo, hoặc cảnh báo lỗi kèm log tail |
+| **Diagnostics** | chỉ `workflow_dispatch` | Chọn 1 trong 4 việc: `telegram_check`, `telegram_test_message`, `sample_report`, `endpoint_probe` |
+
+Input của **Breadth Composite Daily**: `full_fetch` (mặc định `false`), `notify` (mặc định `true`), `send_email` (mặc định `false`). Với `notify = false` pipeline chạy `--no-notify` và không gửi gì.
 
 ### Cấu hình GitHub Secrets
 
@@ -247,7 +289,7 @@ Workflow `.github/workflows/breadth_daily.yml` chạy: **cài đặt → pytest 
 
 ### Kích hoạt pipeline
 
-**Cách 1: Trigger thủ công** — Actions → "Breadth Composite Daily" → "Run workflow" (tuỳ chọn `full_fetch`, `send_email`).
+**Cách 1: Trigger thủ công** — Actions → "Breadth Composite Daily" → "Run workflow" (tuỳ chọn `full_fetch`, `notify`, `send_email`).
 
 **Cách 2: Bật lịch tự động** — bỏ comment trong `breadth_daily.yml`:
 
@@ -296,6 +338,7 @@ Thư mục `output/` nằm trong `.gitignore` — không commit dữ liệu lên
 - ✅ `.env`, `output/`, `*.parquet`, `*.xlsx` đều có trong `.gitignore`
 - ✅ `requirements.txt` không còn `--extra-index-url` trỏ tới index bên thứ ba (tránh rủi ro dependency confusion); mọi thư viện đến từ PyPI
 - ✅ Báo cáo (PNG, Excel, Telegram, prompt Gemini) **không ghi tên nhà cung cấp dữ liệu** — test `test_no_provider_attribution_in_user_facing_modules` chặn việc vô tình thêm vào
+- ✅ Log và Summary chỉ in *độ dài* của secret, không in giá trị; thông báo lỗi của Telegram được in nguyên văn để dễ sửa cấu hình
 
 ---
 

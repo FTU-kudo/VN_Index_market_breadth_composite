@@ -3,10 +3,14 @@
 main.py — Breadth Composite Pipeline Orchestrator
 
 Usage:
-  python main.py               # incremental (default)
-  python main.py --full        # full 6-year re-fetch
-  python main.py --dry-run     # compute only, no cache/Excel/chart/Telegram
-  python main.py --send-email  # email Excel after export
+  python main.py                 # incremental (default)
+  python main.py --full          # full 6-year re-fetch
+  python main.py --dry-run       # compute only, no cache/Excel/chart/Telegram
+  python main.py --no-notify     # skip Gemini + Telegram
+  python main.py --strict-notify # exit code 3 when Telegram delivery fails
+  python main.py --send-email    # email Excel after export
+
+Exit codes: 0 = ok, 1 = fatal (no data), 3 = report built but Telegram failed.
 
 Data comes from the price-board + history endpoints via breadth_composite.yuanta_api.
 No API-key bootstrap is needed; GEMINI_API_KEY / TELEGRAM_* are only used by notify.
@@ -31,6 +35,9 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Breadth Composite Pipeline")
     p.add_argument("--full",       action="store_true", help="re-download the whole window")
     p.add_argument("--dry-run",    action="store_true", help="compute only, write nothing")
+    p.add_argument("--no-notify",  action="store_true", help="skip Gemini + Telegram")
+    p.add_argument("--strict-notify", action="store_true",
+                   help="exit 3 when the Telegram report could not be delivered")
     p.add_argument("--send-email", action="store_true")
     p.add_argument("--output-dir", default=None)
     return p.parse_args()
@@ -132,14 +139,28 @@ def main() -> int:
     logger.info("Chart PNG: %s", chart_path)
 
     # 8 — Gemini analysis + Telegram notify
-    logger.info("=== STEP 8: Gemini + Telegram ===")
-    from breadth_composite.notify import notify_daily
-    notify_daily(breadth, chart_png_path=chart_path)
+    notify_failed = False
+    if args.no_notify:
+        logger.info("=== STEP 8: Gemini + Telegram skipped (--no-notify) ===")
+    else:
+        logger.info("=== STEP 8: Gemini + Telegram ===")
+        from breadth_composite.notify import notify_daily
+        result = notify_daily(breadth, chart_png_path=chart_path)
+        logger.info("Notification: %s", result.summary())
+        notify_failed = not result.delivered
 
     # 9 — Email (disabled by default, kept for future use)
     if args.send_email:
         logger.info("=== STEP 9: Send email ===")
         _send_email(excel_path)
+
+    if notify_failed:
+        logger.error(
+            "Pipeline xong nhưng KHÔNG gửi được Telegram. Kiểm tra TELEGRAM_TOKEN / "
+            "TELEGRAM_ID (Actions → Diagnostics → telegram_check)."
+        )
+        if args.strict_notify:
+            return 3
 
     logger.info("=== Pipeline complete ===")
     return 0

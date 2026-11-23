@@ -11,22 +11,22 @@ on:
   workflow_dispatch:
     inputs:
       full_fetch:
-        description: "Force full 6-year re-fetch (true/false)"
+        description: "Tải lại toàn bộ 6 năm (true/false)"
         required: false
         default: "false"
+      notify:
+        description: "Gửi báo cáo Telegram (true/false)"
+        required: false
+        default: "true"
       send_email:
-        description: "Send email after export (true/false)"
-        required: false
-        default: "false"
-      probe_only:
-        description: "Only run the live endpoint probe, skip the pipeline (true/false)"
+        description: "Gửi email sau khi export (true/false)"
         required: false
         default: "false"
 
 permissions:
   contents: read
 
-# One writer at a time: two runs would race on the OHLCV cache.
+# Một writer tại một thời điểm: hai run song song sẽ tranh nhau cache OHLCV.
 concurrency:
   group: breadth-composite
   cancel-in-progress: false
@@ -55,9 +55,53 @@ jobs:
       - name: Run test suite
         run: python -m pytest
 
-      # A per-run cache key is required: Actions caches are immutable, so a
-      # fixed key would freeze the Parquet at the first successful run and every
-      # later "incremental" run would start from that stale snapshot.
+      - name: Resolve options
+        id: opts
+        run: |
+          NOTIFY="${{ github.event.inputs.notify }}"
+          if [ -z "$NOTIFY" ]; then NOTIFY="true"; fi
+          FULL="${{ github.event.inputs.full_fetch }}"
+          if [ -z "$FULL" ]; then FULL="${{ github.event.client_payload.full_fetch }}"; fi
+          EMAIL="${{ github.event.inputs.send_email }}"
+          echo "notify=$NOTIFY" >> "$GITHUB_OUTPUT"
+          echo "full=$FULL"     >> "$GITHUB_OUTPUT"
+          echo "email=$EMAIL"   >> "$GITHUB_OUTPUT"
+          echo "Chế độ: notify=$NOTIFY | full_fetch=$FULL | email=$EMAIL"
+
+      # Không in giá trị secret, chỉ in trạng thái — để biết ngay secret nào thiếu.
+      - name: Kiểm tra secret (không in giá trị)
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_ID:    ${{ secrets.TELEGRAM_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          {
+            echo "### Cấu hình kênh báo cáo"
+            echo ""
+            echo "| Secret | Trạng thái |"
+            echo "|---|---|"
+            for name in TELEGRAM_TOKEN TELEGRAM_ID GEMINI_API_KEY; do
+              value="${!name}"
+              if [ -n "$value" ]; then
+                echo "| $name | đã set (${#value} ký tự) |"
+              else
+                echo "| $name | **THIẾU** |"
+              fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # getMe/getChat: phát hiện token sai hoặc chat_id sai TRƯỚC khi chạy pipeline.
+      # continue-on-error để vẫn chạy pipeline; nếu sai, log sẽ nói rõ lỗi gốc của Telegram.
+      - name: Telegram preflight (getMe / getChat)
+        if: steps.opts.outputs.notify == 'true'
+        continue-on-error: true
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_ID:    ${{ secrets.TELEGRAM_ID }}
+        run: python tools/notify_test.py --check
+
+      # Cache Actions là bất biến: key cố định sẽ bị "đóng băng" ở lần lưu đầu tiên
+      # và mọi run sau đều restore đúng bản cũ. Vì vậy key có run_id + restore-keys.
       - name: Restore OHLCV cache
         uses: actions/cache/restore@v4
         with:
@@ -66,28 +110,31 @@ jobs:
           restore-keys: |
             ohlcv-cache-${{ runner.os }}-
 
-      - name: Probe endpoints (diagnostic)
-        if: github.event.inputs.probe_only == 'true'
-        run: python tools/probe_yuanta.py --json output/probe_yuanta.json
-
       - name: Run pipeline
-        if: github.event.inputs.probe_only != 'true'
+        id: pipeline
         env:
           PYTHONUNBUFFERED: "1"
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_ID:    ${{ secrets.TELEGRAM_ID }}
         run: |
+          set -o pipefail
+          mkdir -p output
           FLAGS=""
-          if [ "${{ github.event.inputs.full_fetch }}" = "true" ] || \
-             [ "${{ github.event.client_payload.full_fetch }}" = "true" ]; then
+          if [ "${{ steps.opts.outputs.full }}" = "true" ]; then
             FLAGS="$FLAGS --full"
           fi
-          if [ "${{ github.event.inputs.send_email }}" = "true" ]; then
+          if [ "${{ steps.opts.outputs.email }}" = "true" ]; then
             FLAGS="$FLAGS --send-email"
           fi
+          if [ "${{ steps.opts.outputs.notify }}" = "true" ]; then
+            # exit 3 nếu báo cáo không gửi được Telegram → run đỏ, không im lặng
+            FLAGS="$FLAGS --strict-notify"
+          else
+            FLAGS="$FLAGS --no-notify"
+          fi
           echo "python main.py ${FLAGS}"
-          python main.py ${FLAGS}
+          python main.py ${FLAGS} 2>&1 | tee output/pipeline.log
 
       - name: Save OHLCV cache
         if: always() && hashFiles('output/breadth_data_cache.parquet') != ''
@@ -97,6 +144,7 @@ jobs:
           key: ohlcv-cache-${{ runner.os }}-${{ github.run_id }}
 
       - name: Upload Excel artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: breadth-report-${{ github.run_id }}
@@ -104,22 +152,45 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-      - name: Upload probe report
-        if: always() && hashFiles('output/probe_yuanta.json') != ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: probe-report-${{ github.run_id }}
-          path: output/probe_yuanta.json
-          if-no-files-found: warn
-          retention-days: 14
-
       - name: Upload chart artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: breadth-chart-${{ github.run_id }}
           path: output/breadth_chart.png
           if-no-files-found: warn
           retention-days: 30
+
+      - name: Upload pipeline log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-log-${{ github.run_id }}
+          path: output/pipeline.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      # Luôn có tin nhắn trong Telegram: hoặc báo cáo (thành công) hoặc cảnh báo lỗi.
+      - name: Báo lỗi qua Telegram
+        if: failure() && steps.opts.outputs.notify == 'true'
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_ID:    ${{ secrets.TELEGRAM_ID }}
+        run: python tools/notify_test.py --failure --log output/pipeline.log
+
+      - name: Run summary
+        if: always()
+        run: |
+          {
+            echo ""
+            echo "### Kết quả"
+            echo ""
+            echo "- Pipeline: **${{ steps.pipeline.outcome || 'skipped' }}**"
+            echo "- Telegram: ${{ steps.opts.outputs.notify == 'true' && 'bật' || 'tắt' }}"
+            echo "- Ghi chú: nếu phần Telegram lỗi, mở step **Telegram preflight** để xem lỗi gốc"
+            echo "  (sai token / sai chat_id / bot chưa được add vào group)."
+            echo "- Kiểm tra nhanh: chạy workflow **Diagnostics → telegram_check**."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   send-email:
     name: Send Email Report
